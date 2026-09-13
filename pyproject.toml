@@ -1,0 +1,28 @@
+[project]
+name = "devenv-forge"
+version = "0.1.0"
+description = "Build and share Podman development environment images"
+readme = "README.md"
+authors = [
+    { name = "Stefan Ghitescu", email = "stefan.ghitescu91@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "pyqt6>=6.11.0",
+]
+
+[project.scripts]
+devenv-forge = "devenv_forge:main"
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
