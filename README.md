@@ -694,6 +694,15 @@ place and their precedence, and only entries that are genuinely absent are
 appended. Two entries count as the same directory when they match after case,
 quoting, a trailing separator and variable expansion are normalised away.
 
+**The lookup is cached, so every fix that moves podman retracts it.** Resolving
+podman touches PATH, then the registry, then several install directories, so the
+answer is cached for the life of the process. Nothing about installing podman
+tells that cache it has gone stale: a "not found" recorded before the fix would
+be handed to every check that runs afterwards, and the tool would report a
+podman it had installed itself as missing until it was restarted. Every remedy
+that installs podman or edits PATH calls `Platform.drop_cached_podman()` before
+returning, and only on success -- a declined UAC prompt changed nothing.
+
 **`wsl.exe` ships with Windows even when the feature is off**, so its presence
 proves nothing. It has to actually answer.
 

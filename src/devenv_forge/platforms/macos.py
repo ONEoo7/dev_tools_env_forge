@@ -130,6 +130,7 @@ class MacOSPlatform(MachinePlatform):
                     code = text
             if code != "0":
                 return RemedyOutcome(False, f"brew exited with code {code}.")
+            self.drop_cached_podman()
             return RemedyOutcome(True, "podman installed via Homebrew.")
 
         return Remedy(

@@ -301,3 +301,189 @@ class TestRepairEnvironment:
     def test_known_folder_does_not_depend_on_the_variable(self, monkeypatch) -> None:
         monkeypatch.delenv("APPDATA", raising=False)
         assert podman._known_folder(podman._FOLDER_IDS["APPDATA"]).endswith("Roaming")
+
+
+class TestInstallInvalidatesTheCache:
+    """A fix that installs podman has to retract the lookup that missed it.
+
+    The regression: the first preflight run caches "no podman" on behalf of the
+    VS Code checks. Fix installs it. The automatic re-check reads the same
+    cached miss, so those checks still report "Waiting on the podman CLI" for a
+    podman the tool had just installed, until the application was restarted.
+    """
+
+    @pytest.fixture
+    def installed(self, monkeypatch, tmp_path):
+        """A podman that does not exist yet, in a directory the lookup knows.
+
+        Yields a callable that brings it into being, as the installer would.
+        """
+        binary = tmp_path / ("podman.exe" if os.name == "nt" else "podman")
+        monkeypatch.setattr(podman, "which", lambda _name: None)
+        monkeypatch.setattr(podman, "reload_path_from_registry", lambda: False)
+        monkeypatch.setattr(podman, "_known_dirs", lambda: [str(tmp_path)])
+
+        # What the VS Code checks do on a machine with no podman, and cache.
+        assert podman.executable() == ""
+
+        def install() -> str:
+            binary.write_text("", encoding="utf-8")
+            return str(binary)
+
+        return install
+
+    def test_a_check_after_a_winget_install_sees_podman(
+        self, monkeypatch, installed
+    ) -> None:
+        from devenv_forge.core.models import ProgressSink
+        from devenv_forge.platforms import windows as win
+        from devenv_forge.platforms.base import PodmanProbe
+
+        path = installed()
+        monkeypatch.setattr(
+            win, "which", lambda name: path if name == "podman" else "winget.exe"
+        )
+        monkeypatch.setattr(
+            win.winenv,
+            "run_elevated_script",
+            lambda *a, **kw: win.winenv.ElevatedResult(True, 0),
+        )
+        monkeypatch.setattr(
+            win.WindowsPlatform, "_reload_path_from_registry", staticmethod(lambda: None)
+        )
+        monkeypatch.setattr(
+            win, "probe_podman", lambda p: PodmanProbe(path=p, version="5.8.3", works=True)
+        )
+
+        outcome = win.WindowsPlatform()._winget_run(
+            ProgressSink(), "install", win.WINGET_PODMAN_ID
+        )
+
+        assert outcome.ok
+        assert podman.executable() == path
+
+    def test_a_check_after_the_path_repair_sees_podman(
+        self, monkeypatch, installed
+    ) -> None:
+        """Repairing PATH moves podman into view without installing anything."""
+        from devenv_forge.core.models import ProgressSink
+        from devenv_forge.platforms import windows as win
+
+        path = installed()
+        monkeypatch.setattr(
+            win.winenv,
+            "add_to_user_path",
+            lambda directory, backup_dir: win.winenv.PathWriteResult(True, "added"),
+        )
+
+        remedy = win.WindowsPlatform()._add_to_path_remedy(os.path.dirname(path))
+        outcome = remedy.action(ProgressSink())
+
+        assert outcome.ok
+        assert podman.executable() == path
+
+    def test_a_check_after_the_homebrew_install_sees_podman(
+        self, monkeypatch, installed
+    ) -> None:
+        from devenv_forge.core.models import ProgressSink
+        from devenv_forge.platforms import macos
+
+        path = installed()
+        monkeypatch.setattr(macos, "which", lambda _name: "/opt/homebrew/bin/brew")
+        monkeypatch.setattr(macos, "stream", lambda *a, **kw: iter([("exit", "0")]))
+
+        outcome = macos.MacOSPlatform()._brew_install_remedy().action(ProgressSink())
+
+        assert outcome.ok
+        assert podman.executable() == path
+
+    def test_a_check_after_the_package_manager_install_sees_podman(
+        self, monkeypatch, installed
+    ) -> None:
+        from devenv_forge.core.models import ProgressSink
+        from devenv_forge.platforms import linux
+
+        path = installed()
+        monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+        monkeypatch.setattr(linux, "stream", lambda *a, **kw: iter([("exit", "0")]))
+
+        platform = linux.LinuxPlatform()
+        platform._manager = ("apt-get", ["apt-get", "install", "-y", "podman"], "APT")
+        outcome = platform._install_remedy().action(ProgressSink())
+
+        assert outcome.ok
+        assert podman.executable() == path
+
+    def test_the_dev_containers_check_stops_waiting_after_the_install(
+        self, monkeypatch, tmp_path, installed
+    ) -> None:
+        """The reported symptom, end to end.
+
+        The check asks for podman's path, is told there is none, and skips. The
+        install happens. Asked again, it has to get the new path -- before the
+        fix it got the cached miss and went on waiting for a podman that was by
+        then installed and on PATH.
+        """
+        from devenv_forge.core import vscode
+        from devenv_forge.core.models import ProgressSink, Status
+        from devenv_forge.platforms import windows as win
+        from devenv_forge.platforms.base import PodmanProbe
+
+        monkeypatch.setattr(vscode, "find_cli", lambda: "code")
+        monkeypatch.setattr(
+            vscode, "user_settings_path", lambda: tmp_path / "settings.json"
+        )
+        platform = win.WindowsPlatform()
+
+        waiting = platform.check_devcontainers_engine()
+        assert waiting.status is Status.SKIPPED
+        assert waiting.summary == "Waiting on the podman CLI"
+
+        path = installed()
+        monkeypatch.setattr(
+            win, "which", lambda name: path if name == "podman" else "winget.exe"
+        )
+        monkeypatch.setattr(
+            win.winenv,
+            "run_elevated_script",
+            lambda *a, **kw: win.winenv.ElevatedResult(True, 0),
+        )
+        monkeypatch.setattr(
+            win.WindowsPlatform, "_reload_path_from_registry", staticmethod(lambda: None)
+        )
+        monkeypatch.setattr(
+            win, "probe_podman", lambda p: PodmanProbe(path=p, version="5.8.3", works=True)
+        )
+        assert platform._winget_run(
+            ProgressSink(), "install", win.WINGET_PODMAN_ID
+        ).ok
+
+        settled = platform.check_devcontainers_engine()
+        assert settled.status is Status.REPAIRABLE
+        assert settled.remedy is not None
+        assert path in settled.remedy.description
+
+    def test_a_failed_install_is_not_a_reason_to_re_resolve(self, monkeypatch) -> None:
+        """Only success retracts it; a declined UAC prompt changed nothing."""
+        from devenv_forge.core.models import ProgressSink
+        from devenv_forge.platforms import windows as win
+
+        calls = {"n": 0}
+
+        def counting_forget() -> None:
+            calls["n"] += 1
+
+        monkeypatch.setattr(podman, "forget", counting_forget)
+        monkeypatch.setattr(win, "which", lambda _name: "winget.exe")
+        monkeypatch.setattr(
+            win.winenv,
+            "run_elevated_script",
+            lambda *a, **kw: win.winenv.ElevatedResult(False, None, cancelled=True),
+        )
+
+        outcome = win.WindowsPlatform()._winget_run(
+            ProgressSink(), "install", win.WINGET_PODMAN_ID
+        )
+
+        assert not outcome.ok
+        assert calls["n"] == 0

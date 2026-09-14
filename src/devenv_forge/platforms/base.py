@@ -532,6 +532,22 @@ class Platform(ABC):
 
     # -- shared helpers ----------------------------------------------------
 
+    @staticmethod
+    def drop_cached_podman() -> None:
+        """Forget where podman was, after a fix that may have moved it.
+
+        ``core.podman.executable()`` caches its answer for the life of the
+        process, and nothing about installing podman or putting its directory on
+        PATH tells that cache it has gone stale. Left alone, a "not found"
+        recorded before the fix is handed to every check that follows, and the
+        tool goes on reporting a podman it installed itself as missing until it
+        is restarted. Every remedy that installs podman or changes PATH calls
+        this before returning.
+        """
+        from ..core import podman as podman_cli
+
+        podman_cli.forget()
+
     def find_podman_on_path(self) -> str | None:
         """Stage 1.1: plain PATH lookup."""
         return which("podman")
@@ -819,9 +835,9 @@ class MachinePlatform(Platform):
         restored = podman_cli.repair_environment()
         if restored:
             sink.log(f"Restored {', '.join(restored)} for this process")
-        # The lookup is cached, and podman may have been installed by an earlier
-        # fix in this same batch, after that cache said there was none.
-        podman_cli.forget()
+        # Podman may have arrived since the cache last answered -- installed by
+        # an earlier fix in this same batch, or by the user in another window.
+        self.drop_cached_podman()
         return self.podman_executable()
 
     def podman_executable(self) -> str:

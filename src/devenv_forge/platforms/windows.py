@@ -345,6 +345,7 @@ class WindowsPlatform(MachinePlatform):
             sink.log(result.message)
             if not result.ok:
                 return RemedyOutcome(False, result.message)
+            self.drop_cached_podman()
             sink.log(
                 "Open a new terminal for the change to be visible there; "
                 "already-running shells keep their inherited PATH."
@@ -427,6 +428,7 @@ class WindowsPlatform(MachinePlatform):
         # PATH set by the installer is not in this process yet; pull it in so a
         # re-check succeeds without restarting the app.
         self._reload_path_from_registry()
+        self.drop_cached_podman()
         sink.step("Verifying the installation")
         found = which("podman") or (
             self.find_podman_in_known_dirs()[:1] or [""]

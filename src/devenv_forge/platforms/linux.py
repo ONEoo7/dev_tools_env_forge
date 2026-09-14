@@ -21,7 +21,7 @@ from ..core.models import (
     RemedyOutcome,
     Status,
 )
-from ..core.runner import run, stream, which
+from ..core.runner import stream, which
 from .base import Platform, probe_podman
 
 #: Package manager, install argv template, human label.
@@ -139,6 +139,7 @@ class LinuxPlatform(Platform):
                     f"{label} exited with code {code}. Run this in a terminal "
                     f"where sudo can prompt: sudo {' '.join(argv)}",
                 )
+            self.drop_cached_podman()
             return RemedyOutcome(True, f"podman installed with {label}.")
 
         return Remedy(
