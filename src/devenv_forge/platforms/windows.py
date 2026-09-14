@@ -31,9 +31,9 @@ from ..core.models import (
     RemedyOutcome,
     Status,
 )
-from ..core.runner import run, stream, which
+from ..core.runner import merge_path, run, stream, which
 from . import winenv
-from .base import Platform, probe_podman
+from .base import MachinePlatform, probe_podman
 
 #: winget package that ships the podman engine and `podman machine`.
 WINGET_PODMAN_ID = "RedHat.Podman"
@@ -46,9 +46,14 @@ WSL_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?")
 WIN11_MIN_BUILD = 22000
 
 
-class WindowsPlatform(Platform):
+class WindowsPlatform(MachinePlatform):
     family = OSFamily.WINDOWS
     installer_name = "winget"
+    machine_note = (
+        "The machine is a WSL2 distribution of its own, so it appears in "
+        "wsl --list --verbose as podman-machine-default next to any "
+        "distribution you already use."
+    )
 
     @property
     def backend_title(self) -> str:
@@ -444,26 +449,23 @@ class WindowsPlatform(Platform):
 
     @staticmethod
     def _reload_path_from_registry() -> None:
-        """Rebuild this process PATH from the machine and user values."""
+        """Add the stored machine and user PATH entries to this process's own.
+
+        Added, never substituted. This runs straight after an install, when the
+        directory the installer wrote is in the registry but not yet in this
+        process; replacing PATH with the registry's copy would pick that up and
+        simultaneously discard everything the launching shell had added, which
+        stays invisible until some unrelated tool fails to launch.
+        """
         if sys.platform != "win32":
             return
-        try:
-            import winreg
-
-            parts: list[str] = []
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-            ) as key:
-                parts.append(os.path.expandvars(str(winreg.QueryValueEx(key, "Path")[0])))
-        except OSError:
-            parts = []
-        user_raw = winenv.read_user_path()[0]
-        if user_raw:
-            parts.append(os.path.expandvars(user_raw))
-        merged = os.pathsep.join(p for p in parts if p)
-        if merged:
-            os.environ["PATH"] = merged
+        stored = [
+            os.path.expandvars(raw)
+            for raw in (winenv.read_machine_path(), winenv.read_user_path()[0])
+            if raw
+        ]
+        if stored:
+            os.environ["PATH"] = merge_path(os.environ.get("PATH", ""), *stored)
 
     # -- WSL2 --------------------------------------------------------------
 
@@ -783,89 +785,6 @@ class WindowsPlatform(Platform):
             action=action,
             requires_elevation=False,
             estimated="instant",
-        )
-
-    # -- machine -----------------------------------------------------------
-
-    def check_machine(self) -> CheckResult:
-        podman_result = self.results.get("podman")
-        if podman_result is None or podman_result.status in (
-            Status.MISSING,
-            Status.FAILED,
-        ):
-            return CheckResult(
-                key="machine",
-                title="Podman machine",
-                status=Status.SKIPPED,
-                summary="Waiting on the podman CLI",
-            )
-
-        exe = which("podman")
-        if not exe:
-            found = self.find_podman_in_known_dirs()
-            exe = found[0] if found else ""
-        if not exe:
-            return CheckResult(
-                key="machine",
-                title="Podman machine",
-                status=Status.SKIPPED,
-                summary="podman is not runnable yet",
-            )
-
-        result = run([exe, "machine", "list", "--format", "json"], timeout=60)
-        evidence: dict[str, object] = {"raw": result.output[:2000]}
-        if not result.ok:
-            return CheckResult(
-                key="machine",
-                title="Podman machine",
-                status=Status.INFO,
-                summary="Could not list machines",
-                detail=result.output,
-                evidence=evidence,
-            )
-
-        import json
-
-        try:
-            machines = json.loads(result.stdout or "[]")
-        except ValueError:
-            machines = []
-        if not isinstance(machines, list):
-            machines = []
-        evidence["count"] = len(machines)
-
-        if not machines:
-            return CheckResult(
-                key="machine",
-                title="Podman machine",
-                status=Status.INFO,
-                summary="No machine created yet",
-                detail=(
-                    "Podman is installed but has no Linux machine. Creating and "
-                    "starting one is the next step, and is where image building "
-                    "will run."
-                ),
-                evidence=evidence,
-            )
-
-        running = [m for m in machines if m.get("Running")]
-        names = ", ".join(str(m.get("Name", "?")) for m in machines)
-        evidence["names"] = names
-        if running:
-            return CheckResult(
-                key="machine",
-                title="Podman machine",
-                status=Status.OK,
-                summary=f"{len(running)} of {len(machines)} running ({names})",
-                evidence=evidence,
-            )
-        return CheckResult(
-            key="machine",
-            title="Podman machine",
-            status=Status.INFO,
-            summary=f"Machine present but stopped ({names})",
-            detail="Start it with: podman machine start",
-            evidence=evidence,
         )
 
 

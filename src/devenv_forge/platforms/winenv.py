@@ -16,6 +16,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+# One definition of what makes two PATH entries the same directory. It lives in
+# core so core.podman can merge PATHs too, without importing this Windows module.
+from ..core.runner import normalise_path_entry as normalise_entry
+
 if sys.platform == "win32":  # pragma: no branch
     import winreg
 else:  # pragma: no cover - import shim so the module loads anywhere
@@ -286,14 +290,6 @@ def on_persistent_path(directory: str) -> bool:
             if entry.strip() and normalise_entry(entry) == target:
                 return True
     return False
-
-
-def normalise_entry(entry: str) -> str:
-    """Canonical form used to compare two PATH entries."""
-    expanded = os.path.expandvars(entry.strip().strip('"'))
-    if not expanded:
-        return ""
-    return os.path.normcase(os.path.normpath(expanded)).rstrip("\\/")
 
 
 def path_contains(directory: str, raw_path: str | None = None) -> bool:

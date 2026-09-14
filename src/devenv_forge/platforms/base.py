@@ -13,8 +13,16 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from ..core.models import CheckResult, OSFamily, OSInfo, Status
-from ..core.runner import CommandResult, run, which
+from ..core.models import (
+    CheckResult,
+    OSFamily,
+    OSInfo,
+    ProgressSink,
+    Remedy,
+    RemedyOutcome,
+    Status,
+)
+from ..core.runner import CommandResult, run, stream, which
 
 #: Matches the first version-like token in `podman --version` output, e.g.
 #: "podman version 5.8.3" or "podman.exe version 5.8.3-dev".
@@ -542,3 +550,286 @@ class Platform(ABC):
 
     def candidate_dirs(self) -> Sequence[str]:
         return ()
+
+
+#: The name podman gives a machine when none is supplied. Passing it explicitly
+#: keeps the create step and the start step talking about the same machine.
+DEFAULT_MACHINE_NAME = "podman-machine-default"
+
+#: Output fragments meaning the command failed only because the work was already
+#: done, taken from podman's own messages: "VM already exists" and "VM already
+#: running or starting". Its exit code does not distinguish those from a real
+#: failure, and the machine listing is checked afterwards either way.
+ALREADY_EXISTS = ("already exists",)
+ALREADY_RUNNING = ("already running",)
+
+
+def parse_machines(stdout: str) -> list[dict]:
+    """Rows from `podman machine list --format json`, or an empty list."""
+    import json
+
+    try:
+        rows = json.loads(stdout or "[]")
+    except ValueError:
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def default_machine(machines: Sequence[dict]) -> str:
+    """The machine podman commands act on when given no name."""
+    for row in machines:
+        if row.get("Default"):
+            return str(row.get("Name") or DEFAULT_MACHINE_NAME)
+    if machines:
+        return str(machines[0].get("Name") or DEFAULT_MACHINE_NAME)
+    return DEFAULT_MACHINE_NAME
+
+
+def run_machine_command(
+    sink: ProgressSink,
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    tolerate: Sequence[str] = (),
+) -> tuple[bool, str]:
+    """Run a podman machine command, logging its output as it arrives.
+
+    Creating a machine downloads a disk image, so this streams rather than
+    waiting silently for minutes. Returns ``(ok, output)``; a non-zero exit
+    still counts as ok when the output matches one of *tolerate*.
+    """
+    lines: list[str] = []
+    code = "0"
+    for kind, text in stream(argv, timeout=timeout):
+        if kind == "line":
+            lines.append(text)
+            sink.log(text)
+        else:
+            code = text
+    output = "\n".join(lines)
+    if code == "0":
+        return True, output
+    haystack = output.lower()
+    if any(fragment in haystack for fragment in tolerate):
+        return True, output
+    return False, output or f"exit code {code}"
+
+
+def _last_meaningful_line(output: str) -> str:
+    """The last non-empty line, which is where podman puts its error."""
+    for line in reversed(output.splitlines()):
+        if line.strip():
+            return line.strip()
+    return "no output"
+
+
+class MachinePlatform(Platform):
+    """A platform where podman's Linux side lives in a VM podman manages.
+
+    Windows (WSL2) and macOS (Apple's hypervisor) both build images inside a
+    ``podman machine``; a native Linux host has none, which is why this is a
+    subclass rather than part of :class:`Platform`.
+    """
+
+    #: Anything the OS adds to the explanation of a missing machine.
+    machine_note: str = ""
+
+    # -- check -------------------------------------------------------------
+
+    def check_machine(self) -> CheckResult:
+        title = "Podman machine"
+        podman_result = self.results.get("podman")
+        if podman_result is not None and podman_result.status in (
+            Status.MISSING,
+            Status.FAILED,
+        ):
+            return CheckResult(
+                key="machine",
+                title=title,
+                status=Status.SKIPPED,
+                summary="Waiting on the podman CLI",
+            )
+
+        exe = self.podman_executable()
+        if not exe:
+            return CheckResult(
+                key="machine",
+                title=title,
+                status=Status.SKIPPED,
+                summary="podman is not runnable yet",
+            )
+
+        result = run([exe, "machine", "list", "--format", "json"], timeout=60)
+        evidence: dict[str, object] = {"raw": result.output[:2000]}
+        if not result.ok:
+            return CheckResult(
+                key="machine",
+                title=title,
+                status=Status.INFO,
+                summary="Could not list machines",
+                detail=result.output,
+                evidence=evidence,
+            )
+
+        machines = parse_machines(result.stdout)
+        evidence["count"] = len(machines)
+
+        if not machines:
+            detail = [
+                "Podman is installed but has no Linux machine, and every image is "
+                "built and kept inside one. Creating and starting it is the next "
+                "step; until then podman has nowhere to build.",
+                "",
+                "The first run downloads a Linux disk image of a few hundred "
+                "megabytes, so it takes a few minutes.",
+            ]
+            if self.machine_note:
+                detail += ["", self.machine_note]
+            return CheckResult(
+                key="machine",
+                title=title,
+                status=Status.REPAIRABLE,
+                summary="No machine created yet",
+                detail="\n".join(detail),
+                remedy=self.create_machine_remedy(),
+                evidence=evidence,
+            )
+
+        names = ", ".join(str(m.get("Name", "?")) for m in machines)
+        evidence["names"] = names
+        running = [m for m in machines if m.get("Running")]
+        if running:
+            return CheckResult(
+                key="machine",
+                title=title,
+                status=Status.OK,
+                summary=f"{len(running)} of {len(machines)} running ({names})",
+                evidence=evidence,
+            )
+
+        return CheckResult(
+            key="machine",
+            title=title,
+            status=Status.REPAIRABLE,
+            summary=f"Machine present but stopped ({names})",
+            detail=(
+                "The machine exists but is not running, so podman cannot reach "
+                "the images inside it and a build has nowhere to go. Starting it "
+                "downloads nothing and keeps everything already in there."
+            ),
+            remedy=self.start_machine_remedy(default_machine(machines)),
+            evidence=evidence,
+        )
+
+    # -- remedies ----------------------------------------------------------
+
+    def create_machine_remedy(self) -> Remedy:
+        def action(sink: ProgressSink) -> RemedyOutcome:
+            exe = self._resolve_podman(sink)
+            if not exe:
+                return RemedyOutcome(
+                    False,
+                    "podman could not be found. Install it first, then re-run "
+                    "the checks.",
+                )
+            sink.step(f"Creating {DEFAULT_MACHINE_NAME}; this downloads a Linux image")
+            ok, output = run_machine_command(
+                sink,
+                [exe, "machine", "init", DEFAULT_MACHINE_NAME],
+                timeout=3600,
+                tolerate=ALREADY_EXISTS,
+            )
+            if not ok:
+                return RemedyOutcome(
+                    False,
+                    f"podman machine init failed: {_last_meaningful_line(output)}",
+                )
+            return self._start_machine(sink, exe, DEFAULT_MACHINE_NAME)
+
+        return Remedy(
+            label="Create machine",
+            description=(
+                f"Run podman machine init {DEFAULT_MACHINE_NAME}, then podman "
+                "machine start. The first run downloads a Linux disk image of a "
+                "few hundred megabytes. The machine belongs to your user account, "
+                "so no administrator approval is needed."
+            ),
+            action=action,
+            requires_elevation=False,
+            estimated="3-10 minutes on the first run",
+        )
+
+    def start_machine_remedy(self, name: str = DEFAULT_MACHINE_NAME) -> Remedy:
+        def action(sink: ProgressSink) -> RemedyOutcome:
+            exe = self._resolve_podman(sink)
+            if not exe:
+                return RemedyOutcome(False, "podman could not be found.")
+            return self._start_machine(sink, exe, name)
+
+        return Remedy(
+            label="Start machine",
+            description=(
+                f"Run podman machine start {name}. Nothing is downloaded and the "
+                "images already inside the machine are untouched."
+            ),
+            action=action,
+            requires_elevation=False,
+            estimated="under a minute",
+        )
+
+    # -- remedy helpers ----------------------------------------------------
+
+    def _start_machine(self, sink: ProgressSink, exe: str, name: str) -> RemedyOutcome:
+        sink.step(f"Starting {name}")
+        ok, output = run_machine_command(
+            sink,
+            [exe, "machine", "start", name],
+            timeout=1800,
+            tolerate=ALREADY_RUNNING,
+        )
+        if not ok:
+            return RemedyOutcome(
+                False, f"podman machine start failed: {_last_meaningful_line(output)}"
+            )
+
+        # Trust podman's own listing rather than the exit code: a machine that
+        # reports success and then dies would otherwise be called ready.
+        sink.step("Verifying the machine is running")
+        listed = run([exe, "machine", "list", "--format", "json"], timeout=60)
+        machines = parse_machines(listed.stdout) if listed.ok else []
+        if any(m.get("Running") for m in machines):
+            return RemedyOutcome(True, f"{name} is running. Podman can build images now.")
+        return RemedyOutcome(
+            False,
+            f"{name} was set up, but podman does not report it as running. See "
+            "the activity log for podman's own output.",
+        )
+
+    def _resolve_podman(self, sink: ProgressSink) -> str:
+        """The podman to run a machine command with, with its environment sane.
+
+        ``podman machine init`` writes its connection record under ``%APPDATA%``
+        and finds the machine through the user profile, so a process missing
+        those variables creates a machine it cannot then reach.
+        """
+        from ..core import podman as podman_cli
+
+        restored = podman_cli.repair_environment()
+        if restored:
+            sink.log(f"Restored {', '.join(restored)} for this process")
+        # The lookup is cached, and podman may have been installed by an earlier
+        # fix in this same batch, after that cache said there was none.
+        podman_cli.forget()
+        return self.podman_executable()
+
+    def podman_executable(self) -> str:
+        """Podman's full path: PATH, the stored PATH, then the install dirs."""
+        from ..core import podman as podman_cli
+
+        found = podman_cli.executable()
+        if found:
+            return found
+        candidates = self.find_podman_in_known_dirs()
+        return candidates[0] if candidates else ""

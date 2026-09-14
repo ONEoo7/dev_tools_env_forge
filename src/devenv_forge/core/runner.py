@@ -184,6 +184,51 @@ def stream(
     yield ("exit", str(proc.returncode))
 
 
+def normalise_path_entry(entry: str) -> str:
+    """Canonical form used to compare two PATH entries.
+
+    Case, surrounding quotes and a trailing separator all vary between the
+    registry's copy of PATH and the one a process inherited, and none of them
+    make two entries different directories.
+    """
+    expanded = os.path.expandvars(entry.strip().strip('"'))
+    if not expanded:
+        return ""
+    return os.path.normcase(os.path.normpath(expanded)).rstrip("\\/")
+
+
+def merge_path(current: str, *additions: str) -> str:
+    """Append whatever *additions* hold that *current* does not already have.
+
+    Each addition is a PATH-shaped string of one or more entries. Overwriting
+    PATH with a stored copy is the obvious way to pick up a new install and the
+    wrong one: a process inherits entries from the shell that launched it which
+    were never written to the registry, and replacing the value throws those
+    away for the rest of the session -- silently, until something fails to
+    launch. So *current* is kept verbatim, keeping its entries' precedence, and
+    only genuinely new entries are appended. Returns *current* unchanged when
+    there are none.
+    """
+    seen = {
+        key
+        for key in (normalise_path_entry(e) for e in current.split(os.pathsep))
+        if key
+    }
+    fresh: list[str] = []
+    for addition in additions:
+        for entry in addition.split(os.pathsep):
+            key = normalise_path_entry(entry)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            fresh.append(entry.strip())
+    if not fresh:
+        return current
+    tail = os.pathsep.join(fresh)
+    trimmed = current.rstrip(os.pathsep)
+    return f"{trimmed}{os.pathsep}{tail}" if trimmed else tail
+
+
 def which(name: str, extra_paths: Sequence[str] | None = None) -> str | None:
     """Locate an executable, optionally searching beyond the current PATH."""
     found = shutil.which(name)

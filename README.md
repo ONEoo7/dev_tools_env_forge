@@ -43,7 +43,7 @@ uv run pytest
 | Podman CLI | Is the podman engine installed and reachable? |
 | WSL2 backend | Is WSL2 present, and does it default to version 2? |
 | Machine provider | Will podman use WSL rather than Hyper-V? |
-| Podman machine | Does a Linux machine exist, and is it running? |
+| Podman machine | Does a Linux machine exist, and is it running? Creates and starts one if not. |
 | VS Code Dev Containers | Is the Dev Containers extension installed? Optional. |
 | Dev Containers engine | Does the extension use podman rather than Docker? Optional. |
 | Container Tools engine | Does VS Code's CONTAINERS view use podman? Optional. |
@@ -51,6 +51,44 @@ uv run pytest
 The VS Code checks are optional. They are reported and fixable like the
 others, but never lock the later stages: an unconfigured editor must not stop
 anyone building or running an image.
+
+### The podman machine
+
+Podman on Windows and macOS is a client: every image is built and kept inside a
+Linux machine it manages, and there is none until something creates it. A fresh
+`winget install RedHat.Podman` therefore leaves a working `podman --version` and
+nothing that can build.
+
+That state used to be reported as a note, which read as "usable" when nothing
+was buildable yet. It is a repairable check instead, and its fix runs
+
+```
+podman machine init podman-machine-default
+podman machine start podman-machine-default
+```
+
+Four details decide whether that fix behaves:
+
+- **Both steps, in one fix.** `init` alone leaves a machine that is present and
+  stopped, which is the same dead end one step further along.
+- **"Already exists" is not a failure.** podman exits non-zero for a machine
+  that is already there, and so does `start` for one already running. Those two
+  outputs are tolerated; any other non-zero exit fails with podman's own words.
+- **Success is podman's listing, not the exit code.** After starting, the
+  machine list has to actually report a running machine. A machine that starts
+  and then dies would otherwise be announced as ready.
+- **The environment is repaired first.** `machine init` writes its connection
+  record under `%APPDATA%` and finds the machine through the user profile. A
+  process missing those variables creates a machine it cannot then reach, which
+  is the "running but unreachable" trap described below.
+
+On Windows the machine is a WSL2 distribution of its own, so it appears in
+`wsl --list --verbose` as `podman-machine-default` next to whatever else is
+installed there. The check says so, because an empty-looking `wsl -l -v` is the
+usual reason people go looking.
+
+A machine that exists but is stopped gets the start step on its own: nothing is
+downloaded and the images already inside it are kept.
 
 ### Dev Containers with podman
 
@@ -508,8 +546,8 @@ terminal, since a window is not a console.
 **Podman is located, not assumed to be on PATH.** A process keeps the PATH it
 inherited when it started, so an application launched from a terminal that was
 open before podman was installed cannot see it, however correct the install is.
-The lookup tries PATH, then re-reads PATH from the registry, then the
-directories the installer uses. When podman still cannot be used, the page says
+The lookup tries PATH, then merges the registry's copy of PATH into this
+process's, then the directories the installer uses. When podman still cannot be used, the page says
 which reason applies rather than showing an empty list: not installed, machine
 stopped, or an error with podman's own message. A stopped machine is the
 easiest to confuse, because every image lives inside it and a stopped machine
@@ -645,6 +683,16 @@ rather than `os.environ`; otherwise the tool offers to add a user PATH entry
 that duplicates the machine entry the installer just wrote. After its own
 install, the app reloads PATH from the registry so the follow-up check succeeds
 without a restart.
+
+**That reload adds; it never replaces.** The registry's PATH is not a superset
+of a running process's: a shell contributes entries of its own before launching
+anything, and they were never stored anywhere. Overwriting `os.environ["PATH"]`
+with the registry value therefore discards them for the rest of the session,
+silently, until some unrelated tool can no longer be found. Both reloads merge
+instead, through `merge_path` in `core/runner.py`: existing entries keep their
+place and their precedence, and only entries that are genuinely absent are
+appended. Two entries count as the same directory when they match after case,
+quoting, a trailing separator and variable expansion are normalised away.
 
 **`wsl.exe` ships with Windows even when the feature is off**, so its presence
 proves nothing. It has to actually answer.

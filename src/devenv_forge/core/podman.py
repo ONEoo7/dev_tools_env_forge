@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 
-from .runner import run, which
+from .runner import merge_path, run, which
 
 
 class PodmanState(str, Enum):
@@ -135,10 +135,16 @@ def _known_dirs() -> list[str]:
 
 
 def reload_path_from_registry() -> bool:
-    """Rebuild this process's PATH from the stored machine and user values.
+    """Add the stored machine and user PATH entries to this process's own.
 
     Picks up anything installed since the process started. Windows only; a no-op
     elsewhere, where the same staleness exists but has no registry to consult.
+
+    Added, never substituted: the registry copy is not a superset of what this
+    process holds. A shell adds entries of its own before launching us, and
+    overwriting PATH with the stored value drops those for the rest of the
+    session. Returns True only when PATH actually gained something, which is
+    the one case where a lookup that just failed is worth retrying.
     """
     if sys.platform != "win32":
         return False
@@ -147,7 +153,7 @@ def reload_path_from_registry() -> bool:
     except ImportError:  # pragma: no cover - defensive
         return False
 
-    parts: list[str] = []
+    stored: list[str] = []
     for root, subkey in (
         (
             winreg.HKEY_LOCAL_MACHINE,
@@ -157,16 +163,17 @@ def reload_path_from_registry() -> bool:
     ):
         try:
             with winreg.OpenKey(root, subkey) as key:
-                parts.append(os.path.expandvars(str(winreg.QueryValueEx(key, "Path")[0])))
+                stored.append(os.path.expandvars(str(winreg.QueryValueEx(key, "Path")[0])))
         except OSError:
             continue
-    if not parts:
+    if not stored:
         return False
-    merged = os.pathsep.join(p for p in parts if p)
-    if merged and merged != os.environ.get("PATH"):
-        os.environ["PATH"] = merged
-        return True
-    return False
+    current = os.environ.get("PATH", "")
+    merged = merge_path(current, *stored)
+    if merged == current:
+        return False
+    os.environ["PATH"] = merged
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -186,8 +193,11 @@ def executable() -> str:
     for directory in _known_dirs():
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate):
-            # Put it on PATH so podman's own helper lookups work too.
-            os.environ["PATH"] = f"{os.environ.get('PATH', '')}{os.pathsep}{directory}"
+            # Put it on PATH so podman's own helper lookups work too. Merged
+            # rather than concatenated: a bare append duplicates a directory
+            # already there, and prefixes an empty entry -- the current working
+            # directory -- onto a PATH that happens to be empty.
+            os.environ["PATH"] = merge_path(os.environ.get("PATH", ""), directory)
             return candidate
     return ""
 

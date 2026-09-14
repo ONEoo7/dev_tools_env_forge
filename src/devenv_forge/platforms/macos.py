@@ -23,13 +23,13 @@ from ..core.models import (
     Status,
 )
 from ..core.runner import run, stream, which
-from .base import Platform, probe_podman
+from .base import MachinePlatform, probe_podman
 
 #: Apple silicon Homebrew lives under /opt, Intel under /usr/local.
 BREW_PREFIXES = ("/opt/homebrew", "/usr/local")
 
 
-class MacOSPlatform(Platform):
+class MacOSPlatform(MachinePlatform):
     family = OSFamily.MACOS
     installer_name = "Homebrew"
 
@@ -169,61 +169,3 @@ class MacOSPlatform(Platform):
             ),
             evidence={"raw": result.output[:2000]},
         )
-
-    def check_machine(self) -> CheckResult:
-        return _shared_machine_check()
-
-
-class _MachineMixinHost(Platform):  # pragma: no cover - typing helper only
-    pass
-
-
-def _shared_machine_check() -> CheckResult:
-    """Same podman machine reporting as Windows, minus the WSL specifics."""
-    import json
-
-    exe = which("podman")
-    if not exe:
-        return CheckResult(
-            key="machine",
-            title="Podman machine",
-            status=Status.SKIPPED,
-            summary="Waiting on the podman CLI",
-        )
-    result = run([exe, "machine", "list", "--format", "json"], timeout=60)
-    if not result.ok:
-        return CheckResult(
-            key="machine",
-            title="Podman machine",
-            status=Status.INFO,
-            summary="Could not list machines",
-            detail=result.output,
-        )
-    try:
-        machines = json.loads(result.stdout or "[]")
-    except ValueError:
-        machines = []
-    if not isinstance(machines, list) or not machines:
-        return CheckResult(
-            key="machine",
-            title="Podman machine",
-            status=Status.INFO,
-            summary="No machine created yet",
-            detail="Create one with: podman machine init",
-        )
-    running = [m for m in machines if m.get("Running")]
-    names = ", ".join(str(m.get("Name", "?")) for m in machines)
-    if running:
-        return CheckResult(
-            key="machine",
-            title="Podman machine",
-            status=Status.OK,
-            summary=f"{len(running)} of {len(machines)} running ({names})",
-        )
-    return CheckResult(
-        key="machine",
-        title="Podman machine",
-        status=Status.INFO,
-        summary=f"Machine present but stopped ({names})",
-        detail="Start it with: podman machine start",
-    )
