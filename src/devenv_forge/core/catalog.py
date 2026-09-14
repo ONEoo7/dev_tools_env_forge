@@ -27,6 +27,58 @@ class Cadence(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class Arch:
+    """An architecture an image can be built for.
+
+    Not the machine doing the building. Podman will build for either, but a
+    foreign one runs every command in the image under emulation, which is why
+    the choice is worth making deliberately rather than inheriting.
+    """
+
+    key: str
+    label: str
+    #: What podman calls it, for ``--platform`` and the ``FROM`` prefix.
+    platform: str
+    #: What ``uname -m`` reports inside a container of this architecture.
+    uname: str
+    note: str = ""
+
+
+ARCHES: tuple[Arch, ...] = (
+    Arch(
+        key="amd64",
+        label="x86-64 (amd64)",
+        platform="linux/amd64",
+        uname="x86_64",
+        note="Intel and AMD machines, and nearly every CI runner.",
+    ),
+    Arch(
+        key="arm64",
+        label="ARM64 (aarch64)",
+        platform="linux/arm64",
+        uname="aarch64",
+        note="Raspberry Pi 5, Apple silicon Macs, AWS Graviton.",
+    ),
+)
+
+ARCHES_BY_KEY: dict[str, Arch] = {arch.key: arch for arch in ARCHES}
+ARCH_KEYS: tuple[str, ...] = tuple(arch.key for arch in ARCHES)
+
+
+def host_arch() -> Arch:
+    """The architecture this machine builds without emulation.
+
+    Windows reports AMD64 or ARM64, Linux and macOS x86_64 or aarch64/arm64;
+    anything unrecognised is taken as x86-64, which is what it will be.
+    """
+    import platform as _platform
+
+    if _platform.machine().lower() in ("arm64", "aarch64"):
+        return ARCHES_BY_KEY["arm64"]
+    return ARCHES_BY_KEY["amd64"]
+
+
+@dataclass(frozen=True, slots=True)
 class Distro:
     key: str
     label: str
@@ -35,6 +87,9 @@ class Distro:
     install_cmd: str
     cadence: Cadence
     support: str
+    #: Architectures this base image is published for. Building for one it does
+    #: not have fails at the pull, not at the end of a long build.
+    arches: tuple[str, ...] = ARCH_KEYS
     #: Run before installing, where the package manager needs a refresh.
     update_cmd: str = ""
     #: Run after installing, to keep the image layer small.
@@ -44,6 +99,9 @@ class Distro:
     #: Set when versions come from a stand-in rather than the product itself.
     proxy_note: str = ""
     caveat: str = ""
+
+    def supports(self, arch_key: str) -> bool:
+        return arch_key in self.arches
 
     def install_run(self, packages: Sequence[str], indent: str = "    ") -> str:
         """Build the RUN body that installs *packages* on this distro.
@@ -143,9 +201,13 @@ DISTROS: tuple[Distro, ...] = (
         # half-updated. Initialising it first makes the hook succeed.
         update_cmd="pacman-key --init && pacman-key --populate archlinux",
         clean_cmd="pacman -Scc --noconfirm",
+        # Arch itself targets x86-64; the ARM ports are separate projects with
+        # their own images, so the official one has no arm64 manifest at all.
+        arches=("amd64",),
         caveat=(
             "Rolling. Newest of everything today, different tomorrow, which "
-            "works against a reproducible team image."
+            "works against a reproducible team image. x86-64 only: the "
+            "official image publishes no ARM64 build."
         ),
     ),
 )

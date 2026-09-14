@@ -3,11 +3,16 @@
 None of these are distro packages, so they cannot appear in the base image
 comparison. They are added to the image after the distro packages.
 
-Two families live here. Most come from rustup and cargo, and those need a
+Three families live here. Most come from rustup and cargo, and those need a
 rustup bootstrap: a distro's ``rustc`` package does not provide rustup, so
-``rustup target add`` fails against it. The other family is an SDK checked out
-at a release tag, which needs no Rust at all, so selecting one must not drag a
-toolchain into the image. :data:`RUST_KINDS` is what keeps the two apart.
+``rustup target add`` fails against it. The second is an SDK checked out at a
+release tag, which needs no Rust at all, so selecting one must not drag a
+toolchain into the image. :data:`RUST_KINDS` is what keeps those apart.
+
+The third is a build host set up to an upstream project's own documented
+requirements. Those requirements name a distribution's packages, so such an
+extra is offered on the distributions it was written for and nowhere else --
+:attr:`Extra.distros`.
 """
 
 from __future__ import annotations
@@ -23,6 +28,10 @@ class ExtraKind(str, Enum):
     #: Source checked out at a release tag, not installed from a package
     #: manager and not part of the Rust toolchain.
     SDK = "sdk"
+    #: A distribution configured to somebody else's documented build-host
+    #: requirements: their package list and the settings they insist on.
+    #: Nothing is fetched, so there is no version to pin.
+    BUILD_HOST = "build host"
 
 
 #: The kinds that need rustup present. An SDK checkout does not, so adding one
@@ -46,6 +55,15 @@ class Extra:
     requires: tuple[str, ...] = ()
     #: Distro packages this extra needs in order to build, keyed by distro.
     build_packages: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Distro keys this extra is offered on; empty means all of them. A
+    #: requirement list written for one distribution does not travel: the
+    #: package names are that distribution's, so offering it elsewhere would
+    #: only produce an image that fails to build.
+    distros: tuple[str, ...] = ()
+    #: Architecture keys this extra can be built for; empty means all of them.
+    #: Some requirements are architecture-specific in a way no package rename
+    #: fixes -- a 32-bit x86 multilib has no ARM64 equivalent at all.
+    arches: tuple[str, ...] = ()
     #: "owner/name" on GitHub, for extras pinned to a release tag.
     repo: str = ""
     #: Tag used when the GitHub lookup cannot run, so the file still builds.
@@ -58,6 +76,11 @@ class Extra:
     @property
     def needs_rust(self) -> bool:
         return self.kind in RUST_KINDS
+
+    def applies_to(self, distro_key: str, arch_key: str = "") -> bool:
+        if self.distros and distro_key not in self.distros:
+            return False
+        return not (arch_key and self.arches and arch_key not in self.arches)
 
     @property
     def run_line(self) -> str:
@@ -110,6 +133,76 @@ _PICO_SDK_PACKAGES = {
     "rhel": (),
     "alpine": (),
     "arch": (),
+}
+
+
+#: The Yocto Project's own build-host package list for apt distributions, from
+#: its Quick Build guide at
+#: https://docs.yoctoproject.org/brief-yoctoprojectqs/index.html
+#: Copied in the order the guide writes it, so the two can be compared at a
+#: glance. python3-venv is the single addition: the guide's next step builds a
+#: virtual environment, and a minimal image does not ship venv alongside
+#: python3 the way a desktop install does.
+_YOCTO_PACKAGES = {
+    "ubuntu": (
+        "build-essential",
+        "chrpath",
+        "cpio",
+        "debianutils",
+        "diffstat",
+        "file",
+        "gawk",
+        "gcc",
+        "git",
+        "iputils-ping",
+        "libacl1",
+        "libcrypt-dev",
+        "locales",
+        "python3",
+        "python3-git",
+        "python3-jinja2",
+        "python3-pexpect",
+        "python3-pip",
+        "python3-subunit",
+        "socat",
+        "texinfo",
+        "unzip",
+        "wget",
+        "xz-utils",
+        "zstd",
+        "python3-venv",
+    ),
+}
+
+
+#: The Android Open Source Project's own build-host package list, from its
+#: requirements page at https://source.android.com/docs/setup/start/requirements
+#: Copied in the order that page writes it, with repo last: the same page
+#: installs the repo launcher from apt, and one list keeps it in one layer.
+#: OpenJDK, Make and Python 3 are deliberately absent -- the source tree ships
+#: prebuilt copies of all three, and a second set on PATH is the same trap as
+#: two Rust toolchains.
+_AOSP_PACKAGES = {
+    "ubuntu": (
+        "git-core",
+        "gnupg",
+        "flex",
+        "bison",
+        "build-essential",
+        "zip",
+        "curl",
+        "zlib1g-dev",
+        "libc6-dev-i386",
+        "x11proto-core-dev",
+        "libx11-dev",
+        "lib32z1-dev",
+        "libgl1-mesa-dev",
+        "libxml2-utils",
+        "xsltproc",
+        "unzip",
+        "fontconfig",
+        "repo",
+    ),
 }
 
 
@@ -282,38 +375,114 @@ EXTRAS: tuple[Extra, ...] = (
         ),
         build_packages=_GOOGLETEST_PACKAGES,
     ),
+    Extra(
+        key="yocto",
+        label="Yocto Project build host",
+        kind=ExtraKind.BUILD_HOST,
+        # locale-gen reads the package list installed above; update-locale
+        # writes /etc/default/locale for anything that reads it at login.
+        command="locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8",
+        # Situational and large: nobody wants a Yocto host inside an image
+        # built for firmware work, so this one is asked for rather than assumed.
+        default_on=False,
+        distros=("ubuntu",),
+        env=(("LANG", "en_US.UTF-8"), ("LC_ALL", "en_US.UTF-8")),
+        verify='test -n "$(locale -a | grep -i en_US.utf8)"',
+        note=(
+            "The Yocto Project's documented build-host requirements: the "
+            "package list from its Quick Build guide, and the en_US.UTF-8 "
+            "locale a build refuses to start without. Ubuntu only, because "
+            "that list names apt packages. The build tree deliberately stays "
+            "out of the image: the guide puts it in the working directory, "
+            "which here is /work, and a real build wants 140 GB of free disk "
+            "and 32 GB of RAM. Inside the container the guide continues as "
+            "written -- python3 -m venv ./bitbake-setup-venv, pip install "
+            "bitbake-setup, bitbake-setup init -- and the container has to run "
+            "as an ordinary user, because bitbake refuses to run as root."
+        ),
+        build_packages=_YOCTO_PACKAGES,
+    ),
+    Extra(
+        key="aosp",
+        label="Android (AOSP) build host",
+        kind=ExtraKind.BUILD_HOST,
+        # Nothing to configure: the requirements are a package list, and the
+        # repo launcher is one of the packages on it.
+        command="",
+        # A large, situational set of packages, several of them 32-bit.
+        default_on=False,
+        distros=("ubuntu",),
+        # "A 64-bit x86 system", says the same page, and it is not a formality:
+        # libc6-dev-i386 is a 32-bit x86 multilib with no ARM64 counterpart.
+        arches=("amd64",),
+        verify="repo --version",
+        note=(
+            "The Android Open Source Project's documented build-host packages, "
+            "and the repo launcher that fetches the source. Ubuntu only, "
+            "because that list names apt packages. OpenJDK, Make and Python 3 "
+            "are left out on purpose: the source tree ships prebuilt copies and "
+            "a second set on PATH is the trap. The checkout stays out of the "
+            "image, as AOSP asks for 400 GB of disk -- 250 to check out, 150 to "
+            "build -- and 64 GB of RAM; give the container a volume for it "
+            "rather than a share, because a source tree of this size on a "
+            "Windows-backed path is hundreds of times slower."
+        ),
+        build_packages=_AOSP_PACKAGES,
+    ),
 )
 
 EXTRAS_BY_KEY = {extra.key: extra for extra in EXTRAS}
 
 
-def needs_rust(selected: set[str]) -> bool:
+def needs_rust(
+    selected: set[str], distro_key: str | None = None, arch_key: str = ""
+) -> bool:
     """True when any selected extra requires a rustup toolchain."""
-    return any(extra.needs_rust for extra in resolve(selected))
+    return any(extra.needs_rust for extra in resolve(selected, distro_key, arch_key))
 
 
 def default_selection() -> set[str]:
     return {extra.key for extra in EXTRAS if extra.default_on}
 
 
-def resolve(selected: set[str]) -> list[Extra]:
+def available_for(distro_key: str, arch_key: str = "") -> tuple[Extra, ...]:
+    """The extras offered on *distro_key*, in catalogue order."""
+    return tuple(extra for extra in EXTRAS if extra.applies_to(distro_key, arch_key))
+
+
+def resolve(
+    selected: set[str], distro_key: str | None = None, arch_key: str = ""
+) -> list[Extra]:
     """Return the chosen extras in install order, with prerequisites pulled in.
 
     Order follows the catalogue, which places rustup components before the
     cargo installs that depend on them.
+
+    Given a *distro_key*, and an *arch_key* where it matters, extras not
+    offered there are dropped. A selection outlives a change of base image or
+    architecture -- the Yocto host stays ticked while someone looks at what
+    Debian would give them -- and without this the ticked-but-hidden extra
+    would be written into a file that cannot build it.
     """
     wanted = set(selected)
     for key in list(wanted):
         extra = EXTRAS_BY_KEY.get(key)
         if extra is not None:
             wanted.update(extra.requires)
-    return [extra for extra in EXTRAS if extra.key in wanted]
+    return [
+        extra
+        for extra in EXTRAS
+        if extra.key in wanted
+        and (distro_key is None or extra.applies_to(distro_key, arch_key))
+    ]
 
 
-def extra_packages(selected: set[str], distro_key: str) -> list[str]:
+def extra_packages(
+    selected: set[str], distro_key: str, arch_key: str = ""
+) -> list[str]:
     """Distro packages the chosen extras need in order to build."""
     packages: list[str] = []
-    for extra in resolve(selected):
+    for extra in resolve(selected, distro_key, arch_key):
         for name in extra.build_packages.get(distro_key, ()):
             if name not in packages:
                 packages.append(name)

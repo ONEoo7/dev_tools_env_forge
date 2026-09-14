@@ -266,8 +266,8 @@ visible rather than just felt.
 
 ## Build image and Extras
 
-The build page turns a chosen distribution plus a set of extras into a
-Containerfile, and runs `podman build` on it.
+The build page turns a chosen distribution, a target architecture and a set of
+extras into a Containerfile, and runs `podman build` on it.
 
 **Extras are the toolchain pieces no distribution packages.** They come from
 rustup and cargo, so they cannot appear in the base image comparison:
@@ -284,9 +284,12 @@ rustup and cargo, so they cannot appear in the base image comparison:
 | Raspberry Pi Pico SDK | `git clone` at the latest release tag |
 | picotool | built from source at its release tag |
 | GoogleTest, with gMock | built from source at its release tag |
+| Yocto Project build host | Ubuntu only, see below |
+| Android (AOSP) build host | Ubuntu only, see below |
 
-Every extra starts selected. Untick the ones a team does not need; the
-source builds, probe-rs above all, are what make a full build slow.
+Every extra starts selected, except one written for a single base image.
+Untick the ones a team does not need; the source builds, probe-rs above all,
+are what make a full build slow.
 
 probe-rs compiles from source, so it automatically adds the udev and libusb
 development headers it links against, under the right name for the chosen
@@ -358,6 +361,123 @@ gone.
 seconds, most of it compiling probe-rs, and the smoke test ran each tool:
 arm-none-eabi-gcc 16.2.0, rustc 1.98.1 with all four targets, cargo-size 0.4.0,
 probe-rs 0.32.0, the Pico SDK, picotool 2.3.1 and GoogleTest.
+
+### Choosing the architecture
+
+The machine that builds an image and the machine that runs it need not be the
+same one, so the target is a choice rather than an inheritance: **x86-64
+(amd64)** or **ARM64 (aarch64)**, the second being Raspberry Pi 5, Apple silicon
+and Graviton. It starts on whatever this machine is, because that is the common
+case and the only one that needs no emulation.
+
+**The platform is written into the file, not just passed to the builder.**
+
+```
+FROM --platform=linux/arm64 ubuntu:26.04
+```
+
+A `FROM` without it means whatever the builder happens to be, so the same file
+saved and handed to a colleague on an Apple silicon Mac would quietly produce a
+different image. `podman build --platform` carries the same value, so the
+command alone also says what it produces, which is what ends up in a CI script.
+
+**A base that has no image for the target is refused before the build.** Arch
+Linux publishes x86-64 only -- its ARM ports are separate projects with their
+own images -- so it is greyed out when the target is ARM64, and choosing it
+anyway disables the build and says why. Ubuntu, Debian, Fedora, UBI and Alpine
+all publish both.
+
+**An extra can be architecture-specific too.** The Android build host asks for
+"a 64-bit x86 system" and means it: `libc6-dev-i386` is a 32-bit x86 multilib
+with no ARM64 counterpart, so that extra is offered on x86-64 only. A ticked
+extra that does not apply is hidden rather than cleared, and never reaches the
+file. The rustup targets are indifferent: what hosts the cross-compiler has
+nothing to do with what it compiles for.
+
+**Building for the other architecture needs emulation, and says so.** Every
+command in a foreign image runs under `qemu-user`, which the podman machine
+needs binfmt handlers for. Without them the first `RUN` fails like this, which
+reads as a corrupt binary rather than as a missing interpreter:
+
+```
+Error: exec container process `/bin/sh`: Exec format error
+```
+
+So the page warns before the build whenever the target is not this machine, and
+a failure carrying that message is explained rather than passed through as an
+exit code, with the one command that fixes it:
+
+```
+podman run --rm --privileged docker.io/tonistiigi/binfmt --install all
+```
+
+That registration lasts until the machine restarts. The alternative is to build
+the file where it is native, which is what the platform being written into it
+makes safe.
+
+### The Yocto Project build host
+
+**An extra can be written for one base image and offered on that one only.**
+The Yocto Project publishes its build-host requirements as an apt command
+naming Ubuntu's packages, so the extra carrying them appears when the base is
+Ubuntu 26.04 and nowhere else. Offering it on Fedora or Alpine would only
+produce a Containerfile that cannot build.
+
+It installs [the package list from the Quick Build
+guide](https://docs.yoctoproject.org/brief-yoctoprojectqs/index.html) verbatim
+and in the order given, so the two can be compared at a glance, and enables the
+`en_US.UTF-8` locale that guide also requires -- a Yocto build refuses to start
+without it. `python3-venv` is the single addition: the guide's next step builds
+a virtual environment, and a minimal image does not ship venv alongside
+`python3` the way a desktop install does. The smoke test at the end of the
+build checks the locale really exists.
+
+**The build tree deliberately stays out of the image.** The guide creates it in
+the working directory, which in the container is `/work`, and a real build wants
+140 GB of free disk and 32 GB of RAM. So the image is a host, not a checkout:
+inside it the guide continues as written, with `python3 -m venv
+./bitbake-setup-venv`, `pip install bitbake-setup` and `bitbake-setup init`.
+Run the container as an ordinary user rather than root, because bitbake refuses
+to run as root.
+
+**A tick survives a change of base image, and is ignored while it does not
+apply.** Switching the picker to Debian hides the row rather than clearing it,
+so coming back to Ubuntu finds the selection as it was left. Nothing is written
+out on the strength of a hidden tick: `ImageSpec` resolves its extras against
+its own base image, so the packages, the locale step and the smoke-test line all
+disappear together and the count in the summary follows.
+
+### The Android (AOSP) build host
+
+The same shape as the Yocto host and the reason the gating exists at all: the
+Android Open Source Project publishes [its requirements as an apt
+command](https://source.android.com/docs/setup/start/requirements), so the extra
+carrying them is offered on Ubuntu 26.04 and nowhere else. The seventeen package
+names are copied in the order that page writes them, and the repo launcher rides
+along as an eighteenth, because the same page installs it with
+`apt-get install repo` and one list keeps it in one layer.
+
+**OpenJDK, Make and Python 3 are left out on purpose.** The page says the source
+tree ships prebuilt copies of all three, and a second set on `PATH` is the same
+trap as two Rust toolchains: the build picks up whichever it finds first.
+
+**It is the first extra with no command at all.** Its requirements are a package
+list and nothing else, so the build-host section emits the line saying so rather
+than an empty `RUN`, and the image gains no layer from it. The smoke test still
+runs `repo --version`, which is what turns a package that installed but cannot
+start into a failed build rather than a developer's first confusing morning.
+
+Built and checked on `ubuntu:26.04`, where every documented name still resolves,
+including the transitional ones -- `git-core` is provided by `git`,
+`x11proto-core-dev` and `lib32z1-dev` are real packages -- and `stubs-32.h`
+lands, so the 32-bit development bits work. The image is 784 MB and its repo
+launcher reports 2.54 against the 2.4 the page asks for.
+
+**The checkout belongs in a volume, not a share.** AOSP asks for 400 GB of disk,
+250 to check out and 150 to build, and 64 GB of RAM, so nothing of that lives in
+the image. Where it does live matters: a source tree of that size on a
+Windows-backed path runs at the 9p speeds measured under [Deploy
+container](#volumes-and-why-they-are-not-shares).
 
 ### lcov with GoogleTest
 
@@ -526,9 +646,9 @@ Two things the real build taught, neither visible from inspection:
 
 ## Deploy container
 
-Pick a built image, choose which directories are shared with it, and start it.
-The command is shown before it runs, and the containers list offers stop,
-remove, and a shell.
+Pick a built image, choose which directories are shared with it and which
+volumes it gets, and start it. The command is shown before it runs, and the
+containers list offers stop, remove, and a shell.
 
 **Host paths are passed through exactly as picked.** Podman on Windows
 translates a native Windows path into the machine's view of it, so rewriting it
@@ -536,6 +656,52 @@ here would break it. Drive letters, spaces and the `:ro` suffix all survive,
 because each `-v` value is a single argument and never passes through a shell.
 Shares are read-write by default and write back to the host; the read-only box
 adds `:ro`, which the kernel enforces.
+
+### Volumes, and why they are not shares
+
+A share is a directory of this machine's, handed to the container. A volume is
+storage podman owns. On Windows that is not a distinction about wording, it is a
+distinction about which filesystem the container writes to, and for a build tree
+it decides whether the build is usable at all. The same script in both places,
+2000 small files, measured on this setup:
+
+| | Share, or a volume pinned to a Windows folder | Volume in podman's storage |
+| --- | --- | --- |
+| Filesystem | 9p, backed by NTFS | ext4, inside the machine |
+| Create 2000 small files | 11.3 s | 28 ms |
+| Case sensitive | no, `Foo` and `foo` are one file | yes |
+| `chmod 640` then `stat` | 777 | 640 |
+| Space | whatever the drive has | the machine's disk, which grows on C: |
+
+A Yocto build does millions of small file operations, needs a case-sensitive
+filesystem, and installs files whose modes have to stick. All three of those
+fail on the left. So the Volumes section defaults to podman's own storage, and
+the location is something opted into rather than something to clear.
+
+**A location is translated into the machine's view of it.** `podman volume
+create` resolves its `device` option inside the virtual machine, where `D:`
+means nothing, so `D:\yocto` is written as `/mnt/d/yocto`. A path that is
+already POSIX is one the machine has itself and is passed through untouched,
+which is how a volume is put on a disk mounted inside the machine rather than on
+a Windows drive. A UNC path is refused: the machine sees local drives only.
+
+**Pinning a volume needs the local driver's bind options**, not just a path:
+
+```
+podman volume create --driver local --opt type=none --opt o=bind     --opt device=/mnt/d/yocto yocto-build
+```
+
+**The volumes are created before the container, never by it.** Podman will
+create a named volume on first use, but only ever in its own storage, so a
+volume meant to live somewhere else has to exist before `podman run` asks for
+it. A volume that is already there is reused and said so in the log rather than
+treated as a failure -- podman will not repoint an existing volume, so claiming
+the location typed here took effect would be a lie. A volume that cannot be
+created stops the deploy, because a build tree silently missing is worse than a
+container that did not start.
+
+**Removing a container never removes its volumes.** That is what they are for:
+the container is disposable and the build tree is not.
 
 **Detached containers get a terminal.** A dev image whose command is a shell
 exits immediately under plain `-d`, because the shell has nothing attached and

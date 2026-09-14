@@ -24,9 +24,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..core.catalog import DISTROS, DISTROS_BY_KEY
-from ..core.containerfile import ImageSpec, build_command, generate
-from ..core.extras import EXTRAS, ExtraKind, default_selection, implied_by, resolve
+from ..core.catalog import ARCHES, ARCHES_BY_KEY, DISTROS, DISTROS_BY_KEY, host_arch
+from ..core.containerfile import (
+    ImageSpec,
+    build_command,
+    explain_build_failure,
+    generate,
+)
+from ..core.extras import EXTRAS, ExtraKind, implied_by
 from ..core.github import latest_release
 from ..core.matrix import MatrixResult, build_matrix
 from ..core.paths import data_dir
@@ -35,11 +40,15 @@ from ..core.runner import stream
 from .cards import SectionHeader
 from .theme import Palette
 
+#: Resolved once: the machine does not change architecture while running.
+HOST_ARCH = host_arch()
+
 KIND_LABEL = {
     ExtraKind.RUSTUP_TARGET: "target",
     ExtraKind.RUSTUP_COMPONENT: "component",
     ExtraKind.CARGO_INSTALL: "cargo install",
     ExtraKind.SDK: "git clone",
+    ExtraKind.BUILD_HOST: "build host",
 }
 
 
@@ -148,7 +157,17 @@ class ExtraRow(QFrame):
         layout.addWidget(self.forced)
 
     def _command_text(self, version: str) -> str:
-        """The command as it will be written, with the tag filled in."""
+        """The command as it will be written, with the tag filled in.
+
+        An extra whose requirements are a package list runs no command at all,
+        so it says what it does add rather than leaving the line blank.
+        """
+        if not self.extra.command.strip():
+            # Such an extra is written for one distribution, so that is the
+            # list to count; a row is only ever shown on its own base anyway.
+            key = self.extra.distros[0] if self.extra.distros else ""
+            packages = self.extra.build_packages.get(key, ())
+            return f"{len(packages)} distribution packages" if packages else ""
         if "{version}" not in self.extra.command:
             return self.extra.command
         return self.extra.command.format(version=version or "<unresolved>")
@@ -194,6 +213,9 @@ class BuildPage(QWidget):
 
         self._build_ui()
         self._start_worker()
+        # The picker starts on Debian, so anything written for another
+        # distribution starts hidden.
+        self._apply_distro_availability()
         # Show the rustup and extras part straight away; the distro packages
         # fill in once the matrix arrives.
         self._refresh_preview()
@@ -213,6 +235,14 @@ class BuildPage(QWidget):
         root.addWidget(self.header)
 
         root.addLayout(self._build_options_row())
+
+        # Emulation, or a base that has no image for the chosen target. Never
+        # fatal on its own: the first is slow, the second disables the build.
+        self.arch_note = QLabel("")
+        self.arch_note.setWordWrap(True)
+        self.arch_note.setStyleSheet(f"color: {self.palette_.warn};")
+        self.arch_note.hide()
+        root.addWidget(self.arch_note)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_extras_panel())
@@ -259,8 +289,24 @@ class BuildPage(QWidget):
         for distro in DISTROS:
             self.distro_picker.addItem(distro.label, distro.key)
         self.distro_picker.setCurrentIndex(1)  # Debian, the recommended base
-        self.distro_picker.currentIndexChanged.connect(self._refresh_preview)
+        self.distro_picker.currentIndexChanged.connect(self._on_distro_changed)
         row.addWidget(self.distro_picker)
+
+        row.addSpacing(12)
+        row.addWidget(QLabel("For"))
+        self.arch_picker = QComboBox()
+        for arch in ARCHES:
+            self.arch_picker.addItem(arch.label, arch.key)
+            self.arch_picker.setItemData(
+                self.arch_picker.count() - 1, arch.note, Qt.ItemDataRole.ToolTipRole
+            )
+        # Native by default: the common case, and the only one that needs no
+        # emulation.
+        self.arch_picker.setCurrentIndex(
+            max(0, self.arch_picker.findData(HOST_ARCH.key))
+        )
+        self.arch_picker.currentIndexChanged.connect(self._on_arch_changed)
+        row.addWidget(self.arch_picker)
 
         row.addSpacing(12)
         row.addWidget(QLabel("Rust"))
@@ -302,7 +348,8 @@ class BuildPage(QWidget):
             "Toolchain pieces that no distribution packages. The rustup and "
             "cargo entries add a rustup install to the image, because the "
             "distribution's rustc cannot provide them. The SDK is a source "
-            "checkout and needs no Rust at all."
+            "checkout and needs no Rust at all. A few are written against one "
+            "distribution's packages and appear only when that base is chosen."
         )
         blurb.setObjectName("PageSubtitle")
         blurb.setWordWrap(True)
@@ -415,6 +462,56 @@ class BuildPage(QWidget):
         self.status_message.emit(f"Could not load the package list: {message}")
         self._refresh_preview()
 
+    def _on_distro_changed(self) -> None:
+        self._apply_distro_availability()
+        self._refresh_preview()
+
+    def _on_arch_changed(self) -> None:
+        self._apply_distro_availability()
+        self._refresh_preview()
+
+    def current_arch(self):
+        return ARCHES_BY_KEY[str(self.arch_picker.currentData() or HOST_ARCH.key)]
+
+    def _apply_distro_availability(self) -> None:
+        """Show only what the chosen base and architecture can actually take.
+
+        A hidden row keeps its tick, so coming back finds the selection as it
+        was left. Nothing is written out on the strength of a hidden tick
+        either: the spec resolves its extras against its own base and target.
+
+        A base with no image for the chosen architecture is greyed rather than
+        removed, because the reason belongs next to the name.
+        """
+        key = self.distro_picker.currentData()
+        arch = self.current_arch()
+        model = self.distro_picker.model()
+        for index in range(self.distro_picker.count()):
+            distro = DISTROS_BY_KEY[str(self.distro_picker.itemData(index))]
+            item = model.item(index)
+            if item is not None:
+                item.setEnabled(distro.supports(arch.key))
+                item.setToolTip(
+                    "" if distro.supports(arch.key)
+                    else f"No {arch.label} image is published for {distro.label}."
+                )
+        for row in self.rows:
+            row.setVisible(row.extra.applies_to(key, arch.key))
+
+    def _arch_note(self, spec) -> str:
+        """What is worth saying about building for this target, if anything."""
+        problems = spec.problems()
+        if problems:
+            return problems[0]
+        if spec.arch.key == HOST_ARCH.key:
+            return ""
+        return (
+            f"Building {spec.arch.label} on an {HOST_ARCH.label} machine. Every "
+            "command in the image runs under emulation, which is slower and "
+            "needs qemu-user binfmt handlers registered in the podman machine. "
+            "Without them the first RUN fails with \"Exec format error\"."
+        )
+
     def _on_extra_toggled(self) -> None:
         selected = self.selected_extras()
         for row in self.rows:
@@ -439,6 +536,7 @@ class BuildPage(QWidget):
                     packages.append(cell.package)
         return ImageSpec(
             distro=distro,
+            arch=self.current_arch(),
             packages=packages,
             selected_extras=self.selected_extras(),
             rust_toolchain=self.toolchain_edit.text().strip() or "stable",
@@ -450,11 +548,16 @@ class BuildPage(QWidget):
     def _refresh_preview(self) -> None:
         spec = self.current_spec()
         self.preview.setPlainText(generate(spec))
-        extras = resolve(spec.selected_extras)
+        extras = spec.extras
         self.summary_label.setText(
-            f"{spec.distro.base_image}   {len(spec.packages)} packages   "
-            f"{len(extras)} extras"
+            f"{spec.distro.base_image}   {spec.arch.label}   "
+            f"{len(spec.packages)} packages   {len(extras)} extras"
         )
+        note = self._arch_note(spec)
+        self.arch_note.setText(note)
+        self.arch_note.setVisible(bool(note))
+        # A base with no image for this target cannot be built at all.
+        self.build_button.setEnabled(not spec.problems() and not self._building)
 
     # -- actions -----------------------------------------------------------
 
@@ -499,7 +602,7 @@ class BuildPage(QWidget):
         detail = (
             f"Base: {spec.distro.base_image}\n"
             f"Packages: {len(spec.packages)}\n"
-            f"Extras: {len(resolve(spec.selected_extras))}\n\n"
+            f"Extras: {len(spec.extras)}\n\n"
             "Choose a directory to write the Containerfile into. The build runs "
             "there."
         )
@@ -552,8 +655,7 @@ class BuildPage(QWidget):
             QMessageBox.warning(
                 self,
                 "Build failed",
-                f"podman build exited with code {code}. The build log has the "
-                "details.",
+                explain_build_failure(code, self.log.toPlainText()),
             )
 
     def _tick(self) -> None:

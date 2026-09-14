@@ -28,6 +28,7 @@ from ..core.deploy import (
     ContainerSpec,
     ImageInfo,
     Mount,
+    Volume,
     container_state,
     explain_run_failure,
     image_working_dirs,
@@ -40,6 +41,7 @@ from ..core.deploy import (
     stop_command,
     suggest_name,
     suggest_share_target,
+    suggest_volume,
 )
 from ..core import podman as podman_cli
 from ..core.podman import PodmanState
@@ -48,6 +50,7 @@ from .cards import SectionHeader
 from .theme import Palette
 
 MOUNT_COLUMNS = ("Host directory", "Container path", "Read-only", "")
+VOLUME_COLUMNS = ("Name", "Container path", "Location (empty: inside the machine)")
 
 
 class DeployWorker(QObject):
@@ -102,9 +105,12 @@ class DeployWorker(QObject):
 
     @pyqtSlot(object, bool)
     def deploy(self, spec: ContainerSpec, replace: bool) -> None:
-        """Run the container, and clean up if it fails to start."""
+        """Create the volumes, run the container, clean up a failed start."""
         if replace and spec.name:
             self._stream(remove_command(spec.name))
+
+        if not self._create_volumes(spec):
+            return
 
         code, output = self._stream(spec.argv())
         if code == 0:
@@ -118,6 +124,32 @@ class DeployWorker(QObject):
             self._stream(remove_command(spec.name))
             self.output.emit(f"removed the container {spec.name} left by the failed start")
         self.deploy_finished.emit(False, explain_run_failure(output, spec))
+
+    def _create_volumes(self, spec: ContainerSpec) -> bool:
+        """Create the volumes the container asks for. False stops the deploy.
+
+        A volume that is already there is reused rather than treated as a
+        failure, but its location is whatever it was created with: podman will
+        not repoint an existing volume, so saying so beats letting someone
+        believe the location typed here took effect.
+        """
+        for volume in spec.volumes:
+            if not volume.name.strip():
+                continue
+            code, output = self._stream(volume.create_argv())
+            if code == 0:
+                continue
+            if "already exists" in output.lower():
+                self.output.emit(
+                    f"volume {volume.name} already exists and is reused; its "
+                    "location is the one it was created with"
+                )
+                continue
+            self.deploy_finished.emit(
+                False, f"could not create the volume {volume.name}: {output.strip()}"
+            )
+            return False
+        return True
 
 
 class DeployPage(QWidget):
@@ -175,6 +207,7 @@ class DeployPage(QWidget):
 
         root.addLayout(self._image_row())
         root.addWidget(self._shares_section(), 1)
+        root.addWidget(self._volumes_section(), 1)
         root.addLayout(self._options_row())
 
         preview_label = QLabel("Command")
@@ -267,6 +300,113 @@ class DeployPage(QWidget):
         self.start_label.setWordWrap(True)
         layout.addWidget(self.start_label)
         return panel
+
+    def _volumes_section(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        title = QLabel("Volumes")
+        title.setObjectName("CardTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.add_volume_button = QPushButton("Add volume")
+        self.add_volume_button.clicked.connect(self._add_volume)
+        header.addWidget(self.add_volume_button)
+        self.locate_volume_button = QPushButton("Set location...")
+        self.locate_volume_button.clicked.connect(self._locate_volume)
+        header.addWidget(self.locate_volume_button)
+        self.remove_volume_button = QPushButton("Remove")
+        self.remove_volume_button.clicked.connect(self._remove_volume)
+        header.addWidget(self.remove_volume_button)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "Storage podman owns, created before the container starts. Leave "
+            "the location empty and it lives inside the virtual machine on a "
+            "Linux filesystem, which is what a build tree wants. Give it a "
+            "location to pin it somewhere: a folder on this PC through Set "
+            "location, or a path the machine itself has. Removing the container "
+            "leaves a volume alone."
+        )
+        hint.setObjectName("PageSubtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.volume_table = QTableWidget(0, len(VOLUME_COLUMNS))
+        self.volume_table.setHorizontalHeaderLabels(VOLUME_COLUMNS)
+        self.volume_table.verticalHeader().setVisible(False)
+        self.volume_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        head = self.volume_table.horizontalHeader()
+        head.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        head.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        head.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.volume_table.itemChanged.connect(lambda _i: self._refresh_preview())
+        layout.addWidget(self.volume_table, 1)
+
+        # Only ever a warning: a volume on a Windows drive works, it is just the
+        # wrong place for a build, and saying so beats refusing to start.
+        self.volume_note = QLabel("")
+        self.volume_note.setWordWrap(True)
+        self.volume_note.setStyleSheet(f"color: {self.palette_.warn};")
+        self.volume_note.hide()
+        layout.addWidget(self.volume_note)
+        return panel
+
+    # -- volumes -----------------------------------------------------------
+
+    def _add_volume(self) -> None:
+        """A volume in podman's own storage, which is the one to want."""
+        name, target = suggest_volume(
+            str(self.name_edit.text() or self.image_picker.currentData() or "devenv"),
+            [v.name for v in self.volumes()],
+        )
+        row = self.volume_table.rowCount()
+        self.volume_table.insertRow(row)
+        self.volume_table.setItem(row, 0, QTableWidgetItem(name))
+        self.volume_table.setItem(row, 1, QTableWidgetItem(target))
+        self.volume_table.setItem(row, 2, QTableWidgetItem(""))
+        self._refresh_preview()
+
+    def _locate_volume(self) -> None:
+        """Pin the selected volume to a folder on this machine."""
+        row = self._selected_volume_row()
+        if row is None:
+            QMessageBox.information(
+                self, "Set location", "Select a volume row first."
+            )
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Folder to hold the volume")
+        if not directory:
+            return
+        native = directory.replace("/", "\\") if sys.platform == "win32" else directory
+        self.volume_table.setItem(row, 2, QTableWidgetItem(native))
+        self._refresh_preview()
+
+    def _selected_volume_row(self) -> int | None:
+        rows = {i.row() for i in self.volume_table.selectedItems()}
+        return min(rows) if rows else None
+
+    def _remove_volume(self) -> None:
+        rows = sorted({i.row() for i in self.volume_table.selectedItems()}, reverse=True)
+        for row in rows:
+            self.volume_table.removeRow(row)
+        self._refresh_preview()
+
+    def volumes(self) -> list[Volume]:
+        result: list[Volume] = []
+        for row in range(self.volume_table.rowCount()):
+            cells = [self.volume_table.item(row, column) for column in range(3)]
+            result.append(
+                Volume(
+                    name=cells[0].text().strip() if cells[0] else "",
+                    container=cells[1].text().strip() if cells[1] else "",
+                    location=cells[2].text().strip() if cells[2] else "",
+                )
+            )
+        return result
 
     def _options_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -491,19 +631,26 @@ class DeployPage(QWidget):
             image=str(self.image_picker.currentData() or ""),
             name=self.name_edit.text().strip(),
             mounts=self.mounts(),
+            volumes=self.volumes(),
             detached=self.detached_check.isChecked(),
             remove_on_exit=self.rm_check.isChecked(),
         )
 
     def _refresh_preview(self) -> None:
         spec = self.current_spec()
-        self.preview.setPlainText(spec.preview())
+        setup = spec.setup_preview()
+        # The volume commands run first, so they read first.
+        parts = [part for part in (setup, spec.preview()) if part]
+        self.preview.setPlainText("\n\n".join(parts))
         problems = spec.problems()
         if problems:
             self.problem_label.setText("  •  ".join(problems))
             self.problem_label.show()
         else:
             self.problem_label.hide()
+        warnings = spec.warnings()
+        self.volume_note.setText("  ".join(warnings))
+        self.volume_note.setVisible(bool(warnings))
         self.start_label.setText(start_note(self.working_dirs.get(spec.image), spec.mounts))
         self.deploy_button.setEnabled(not problems and not self._busy)
 

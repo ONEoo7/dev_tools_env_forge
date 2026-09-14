@@ -15,6 +15,7 @@ from devenv_forge.core.extras import (
     EXTRAS,
     EXTRAS_BY_KEY,
     ExtraKind,
+    available_for,
     default_selection,
     extra_packages,
     implied_by,
@@ -40,10 +41,17 @@ class TestExtrasCatalogue:
         assert any(c.startswith("cargo install cargo-binutils") for c in commands)
         assert any(c.startswith("cargo install probe-rs-tools") for c in commands)
 
-    def test_every_extra_is_on_by_default(self) -> None:
-        """The Build image tab starts with everything selected."""
-        assert default_selection() == {extra.key for extra in EXTRAS}
-        assert all(extra.default_on for extra in EXTRAS)
+    def test_every_generally_offered_extra_is_on_by_default(self) -> None:
+        """The Build image tab starts with everything general selected."""
+        general = {extra.key for extra in EXTRAS if not extra.distros}
+        assert default_selection() == general
+        assert all(extra.default_on for extra in EXTRAS if not extra.distros)
+
+    def test_a_distro_specific_extra_has_to_be_asked_for(self) -> None:
+        """Offered on one base image only, so it cannot be a default."""
+        specific = [extra for extra in EXTRAS if extra.distros]
+        assert specific, "the gating exists for a reason; something should use it"
+        assert not any(extra.default_on for extra in specific)
 
     def test_source_builds_are_included_by_default(self) -> None:
         """Including the ones that compile from source and add build time."""
@@ -104,7 +112,7 @@ class TestGeneratedContainerfile:
     def test_no_rust_section_without_extras(self) -> None:
         text = generate(spec_for("debian", set()))
         assert "rustup" not in text
-        assert "FROM debian:13-slim" in text
+        assert "FROM --platform=linux/amd64 debian:13-slim" in text
 
     def test_rustup_bootstrap_added_for_any_extra(self) -> None:
         """A distro rustc cannot satisfy 'rustup target add'."""
@@ -159,7 +167,9 @@ class TestGeneratedContainerfile:
     def test_generates_for_every_distro(self, distro_key: str) -> None:
         text = generate(spec_for(distro_key, default_selection() | {"probe-rs-tools"}))
         distro = DISTROS_BY_KEY[distro_key]
-        assert f"FROM {distro.base_image}" in text
+        # The platform is part of the FROM: a file without it means something
+        # different on a machine of another architecture.
+        assert f"FROM --platform=linux/amd64 {distro.base_image}" in text
         assert distro.install_cmd.split()[0] in text
 
     @pytest.mark.parametrize("distro_key", DISTRO_KEYS)
@@ -178,6 +188,150 @@ class TestGeneratedContainerfile:
     def test_ends_with_a_newline(self) -> None:
         assert generate(spec_for("debian", set())).endswith("\n")
 
+
+
+#: The package list the Yocto Project's Quick Build guide gives for apt
+#: distributions, written out again here so a change to the catalogue has to be
+#: a deliberate one rather than a typo nobody notices.
+YOCTO_DOCUMENTED = (
+    "build-essential chrpath cpio debianutils diffstat file gawk gcc git "
+    "iputils-ping libacl1 libcrypt-dev locales python3 python3-git "
+    "python3-jinja2 python3-pexpect python3-pip python3-subunit socat texinfo "
+    "unzip wget xz-utils zstd"
+).split()
+
+
+class TestYoctoBuildHost:
+    """An extra written against one distribution's documented requirements."""
+
+    def test_it_is_offered_on_ubuntu(self) -> None:
+        assert "yocto" in {extra.key for extra in available_for("ubuntu")}
+
+    @pytest.mark.parametrize("distro_key", [k for k in DISTRO_KEYS if k != "ubuntu"])
+    def test_it_is_offered_nowhere_else(self, distro_key: str) -> None:
+        """Its package names are apt's, and Ubuntu's specifically."""
+        assert "yocto" not in {extra.key for extra in available_for(distro_key)}
+
+    def test_ubuntu_is_the_26_04_base(self) -> None:
+        """The gate is by distro key, and that key is Ubuntu 26.04."""
+        assert DISTROS_BY_KEY["ubuntu"].base_image == "ubuntu:26.04"
+
+    def test_it_carries_the_documented_package_list(self) -> None:
+        packages = extra_packages({"yocto"}, "ubuntu")
+        assert [name for name in packages if name in YOCTO_DOCUMENTED] == YOCTO_DOCUMENTED
+
+    def test_venv_is_the_only_addition(self) -> None:
+        """A minimal image has no python3-venv, and the guide's next step needs it."""
+        extra = set(extra_packages({"yocto"}, "ubuntu")) - set(YOCTO_DOCUMENTED)
+        assert extra == {"python3-venv"}
+
+    def test_a_ticked_but_unoffered_extra_is_not_written_out(self) -> None:
+        """The tick survives a change of base image; the package list must not."""
+        text = generate(spec_for("debian", {"yocto"}))
+        assert "locale-gen" not in text
+        assert "texinfo" not in text
+
+    def test_it_needs_no_rust(self) -> None:
+        """Selecting a build host must not drag a toolchain into the image."""
+        spec = spec_for("ubuntu", {"yocto"})
+        assert not spec.needs_rust
+        assert "rustup" not in generate(spec)
+
+    def test_it_is_not_an_sdk_clone(self) -> None:
+        """Nothing is fetched, so there is no version ARG and no clone."""
+        text = generate(spec_for("ubuntu", {"yocto"}))
+        assert "git clone" not in text
+        assert "YOCTO_VERSION" not in text
+
+    def test_the_locale_is_set_up_and_exported(self) -> None:
+        """A Yocto build refuses to start without en_US.UTF-8."""
+        text = generate(spec_for("ubuntu", {"yocto"}))
+        assert "locale-gen en_US.UTF-8" in text
+        assert "ENV LANG=en_US.UTF-8" in text
+        assert "ENV LC_ALL=en_US.UTF-8" in text
+
+    def test_the_smoke_test_proves_the_locale_exists(self) -> None:
+        """A build-host extra is verified like any other."""
+        assert "en_US.utf8" in generate(spec_for("ubuntu", {"yocto"}))
+
+    def test_it_coexists_with_the_rust_extras(self) -> None:
+        text = generate(spec_for("ubuntu", {"yocto", "thumbv7em"}))
+        assert "rustup target add thumbv7em-none-eabihf" in text
+        assert "locale-gen en_US.UTF-8" in text
+
+    def test_the_note_says_what_the_image_deliberately_leaves_out(self) -> None:
+        """The build tree, its disk appetite and the root refusal all bite."""
+        note = EXTRAS_BY_KEY["yocto"].note
+        assert "140 GB" in note
+        assert "root" in note
+
+
+
+#: The package list on the Android Open Source Project's requirements page,
+#: written out again so a change to the catalogue has to be deliberate.
+AOSP_DOCUMENTED = (
+    "git-core gnupg flex bison build-essential zip curl zlib1g-dev "
+    "libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev "
+    "libxml2-utils xsltproc unzip fontconfig"
+).split()
+
+
+class TestAospBuildHost:
+    """A second host written for one distribution, and the first with no command."""
+
+    def test_it_is_offered_on_ubuntu(self) -> None:
+        assert "aosp" in {extra.key for extra in available_for("ubuntu")}
+
+    @pytest.mark.parametrize("distro_key", [k for k in DISTRO_KEYS if k != "ubuntu"])
+    def test_it_is_offered_nowhere_else(self, distro_key: str) -> None:
+        assert "aosp" not in {extra.key for extra in available_for(distro_key)}
+
+    def test_it_carries_the_documented_package_list(self) -> None:
+        packages = extra_packages({"aosp"}, "ubuntu")
+        assert [name for name in packages if name in AOSP_DOCUMENTED] == AOSP_DOCUMENTED
+
+    def test_the_repo_launcher_comes_with_it(self) -> None:
+        """The same page installs repo from apt, so it rides in one layer."""
+        assert "repo" in extra_packages({"aosp"}, "ubuntu")
+
+    def test_the_prebuilt_tools_are_left_out(self) -> None:
+        """The source tree ships OpenJDK, Make and Python 3; a second set is a trap."""
+        packages = set(extra_packages({"aosp"}, "ubuntu"))
+        assert not packages & {"openjdk-21-jdk", "openjdk-17-jdk", "default-jdk", "make"}
+
+    def test_the_extra_addition_is_only_repo(self) -> None:
+        assert set(extra_packages({"aosp"}, "ubuntu")) - set(AOSP_DOCUMENTED) == {"repo"}
+
+    def test_it_needs_no_rust(self) -> None:
+        spec = spec_for("ubuntu", {"aosp"})
+        assert not spec.needs_rust
+        assert "rustup" not in generate(spec)
+
+    def test_a_requirements_list_needs_no_command(self) -> None:
+        """Nothing to configure, so the image gains packages and no layer."""
+        text = generate(spec_for("ubuntu", {"aosp"}))
+        assert "Android (AOSP) build host" in text
+        assert "Its requirements are the packages installed above." in text
+        # The only RUN lines are the package install and the smoke test; the
+        # host section itself contributes none.
+        assert len([ln for ln in text.splitlines() if ln.startswith("RUN ")]) == 2
+
+    def test_the_smoke_test_proves_repo_runs(self) -> None:
+        assert "repo --version" in generate(spec_for("ubuntu", {"aosp"}))
+
+    def test_a_ticked_but_unoffered_extra_is_not_written_out(self) -> None:
+        assert "xsltproc" not in generate(spec_for("debian", {"aosp"}))
+
+    def test_it_coexists_with_the_other_host(self) -> None:
+        """Two build hosts in one image is odd but must not generate nonsense."""
+        text = generate(spec_for("ubuntu", {"aosp", "yocto"}))
+        assert "locale-gen en_US.UTF-8" in text
+        assert "repo" in text
+        assert text.count("to its own documented requirements") == 2
+
+    def test_the_note_gives_the_hardware_the_docs_ask_for(self) -> None:
+        note = EXTRAS_BY_KEY["aosp"].note
+        assert "400 GB" in note and "64 GB" in note
 
 class TestBuildCommand:
     def test_tags_the_image(self) -> None:

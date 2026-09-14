@@ -10,12 +10,15 @@ from devenv_forge.core.deploy import (
     ContainerSpec,
     ImageInfo,
     Mount,
+    Volume,
     list_containers,
     list_images,
+    machine_path,
     remove_command,
     shell_command,
     stop_command,
     suggest_name,
+    suggest_volume,
 )
 
 
@@ -166,6 +169,185 @@ class TestPreview:
             image="img", mounts=[Mount(host_dir, "/work")]
         ).preview()
 
+
+
+class TestMachinePath:
+    """A volume's device is resolved inside the machine, where C: means nothing."""
+
+    def test_a_drive_letter_becomes_a_mount_point(self) -> None:
+        assert machine_path("D:\\yocto\\build") == "/mnt/d/yocto/build"
+
+    def test_forward_slashes_are_the_same_path(self) -> None:
+        assert machine_path("D:/yocto") == "/mnt/d/yocto"
+
+    def test_a_bare_drive(self) -> None:
+        assert machine_path("D:\\") == "/mnt/d"
+
+    def test_the_drive_letter_is_lowercased(self) -> None:
+        assert machine_path("C:\\Work") == "/mnt/c/Work"
+
+    def test_a_posix_path_is_the_machines_own(self) -> None:
+        """Not everything is a Windows path; the machine has its own disk."""
+        assert machine_path("/var/lib/yocto") == "/var/lib/yocto"
+
+    def test_quotes_and_spaces_survive(self) -> None:
+        assert machine_path('"D:\\my builds"') == "/mnt/d/my builds"
+
+    def test_nothing(self) -> None:
+        assert machine_path("   ") == ""
+
+
+class TestVolume:
+    """Storage podman owns, as opposed to a directory of this desktop's."""
+
+    def test_it_mounts_by_name_not_by_path(self) -> None:
+        assert Volume("yocto-build", "/work/build").to_arg() == "yocto-build:/work/build"
+
+    def test_podman_storage_needs_no_options(self) -> None:
+        assert Volume("v", "/work").create_argv("podman") == [
+            "podman", "volume", "create", "v",
+        ]
+
+    def test_a_location_pins_it_with_the_local_driver(self) -> None:
+        argv = Volume("v", "/work", "D:\\yocto").create_argv("podman")
+        assert argv[:5] == ["podman", "volume", "create", "--driver", "local"]
+        assert "type=none" in argv and "o=bind" in argv
+        assert "device=/mnt/d/yocto" in argv
+        assert argv[-1] == "v"
+
+    def test_the_windows_path_never_reaches_podman(self) -> None:
+        """It would be resolved inside the machine, which has no D: drive."""
+        argv = Volume("v", "/work", "D:\\yocto").create_argv("podman")
+        assert not any("D:" in token for token in argv)
+
+    def test_a_machine_path_is_used_as_typed(self) -> None:
+        argv = Volume("v", "/work", "/var/lib/yocto").create_argv("podman")
+        assert "device=/var/lib/yocto" in argv
+
+
+class TestVolumeWarnings:
+    """Windows-backed storage works; it is the wrong place for a build tree."""
+
+    def test_a_windows_drive_is_flagged(self) -> None:
+        assert Volume("v", "/work", "D:\\yocto").warnings()
+
+    def test_the_flag_carries_the_measurement(self) -> None:
+        """Numbers beat adjectives when someone is about to wait on a build."""
+        note = Volume("v", "/work", "D:\\yocto").warnings()[0]
+        assert "9p" in note and "11.3 s" in note and "28 ms" in note
+
+    def test_a_typed_mount_point_is_flagged_too(self) -> None:
+        """However it was typed, /mnt/d is the same translated path."""
+        assert Volume("v", "/work", "/mnt/d/yocto").warnings()
+
+    def test_podman_storage_is_not_flagged(self) -> None:
+        assert not Volume("v", "/work").warnings()
+
+    def test_a_path_inside_the_machine_is_not_flagged(self) -> None:
+        assert not Volume("v", "/work", "/var/lib/yocto").warnings()
+
+    def test_mnt_wsl_is_not_a_drive(self) -> None:
+        """/mnt is where drives appear, but not everything under it is one."""
+        assert not Volume("v", "/work", "/mnt/wsl/yocto").warnings()
+
+
+class TestVolumeValidation:
+    def test_a_clean_volume_has_no_problems(self, host_dir: str) -> None:
+        assert Volume("yocto-build", "/work/build", host_dir).problems() == []
+
+    def test_podman_storage_needs_no_location(self) -> None:
+        assert Volume("yocto-build", "/work/build").problems() == []
+
+    def test_rejects_an_empty_name(self) -> None:
+        assert any("name is empty" in p for p in Volume("", "/work").problems())
+
+    def test_rejects_a_name_podman_would_refuse(self) -> None:
+        assert any("volume name" in p for p in Volume("has space", "/work").problems())
+
+    def test_container_path_rules_are_the_shares_rules(self) -> None:
+        assert Volume("v", "relative").problems()
+        assert Volume("v", "/usr").problems()
+        assert Volume("v", "/work:extra").problems()
+
+    def test_rejects_a_network_path(self) -> None:
+        """The machine sees local drives; a UNC path is not one of them."""
+        assert any("network path" in p for p in Volume("v", "/work", "\\\\nas\\share").problems())
+
+    def test_rejects_a_relative_location(self) -> None:
+        assert any("absolute" in p for p in Volume("v", "/work", "builds").problems())
+
+    def test_reports_a_location_that_is_not_there(self, tmp_path) -> None:
+        missing = str(tmp_path / "not-created")
+        assert any("does not exist" in p for p in Volume("v", "/work", missing).problems())
+
+    def test_a_machine_path_is_left_to_podman(self) -> None:
+        """This desktop cannot see inside the machine, so it does not guess."""
+        assert Volume("v", "/work", "/var/lib/yocto").problems() == []
+
+
+class TestSpecWithVolumes:
+    def test_volumes_become_v_flags(self, host_dir: str) -> None:
+        spec = ContainerSpec(
+            image="img",
+            mounts=[Mount(host_dir, "/work/layers")],
+            volumes=[Volume("build", "/work/build")],
+        )
+        argv = spec.argv("podman")
+        assert argv.count("-v") == 2
+        assert "build:/work/build" in argv
+        assert argv[-1] == "img"
+
+    def test_setup_runs_before_the_container(self, host_dir: str) -> None:
+        spec = ContainerSpec(image="img", volumes=[Volume("build", "/work/build")])
+        assert spec.setup_argv("podman") == [["podman", "volume", "create", "build"]]
+
+    def test_no_volumes_means_no_setup(self, host_dir: str) -> None:
+        assert ContainerSpec(image="img", mounts=[Mount(host_dir, "/work")]).setup_argv() == []
+
+    def test_a_share_and_a_volume_cannot_share_a_target(self, host_dir: str) -> None:
+        """podman would take the last -v and say nothing."""
+        spec = ContainerSpec(
+            image="img",
+            mounts=[Mount(host_dir, "/work/build")],
+            volumes=[Volume("build", "/work/build")],
+        )
+        assert any("same container path" in p for p in spec.problems())
+
+    def test_two_volumes_cannot_have_one_name(self) -> None:
+        spec = ContainerSpec(
+            image="img",
+            volumes=[Volume("build", "/work/a"), Volume("build", "/work/b")],
+        )
+        assert any("same name" in p for p in spec.problems())
+
+    def test_warnings_are_not_problems(self) -> None:
+        """A Windows-backed volume still starts; it is only worth a word."""
+        spec = ContainerSpec(image="img", volumes=[Volume("build", "/work/build", "D:\\yocto")])
+        assert spec.warnings()
+        assert not any("9p" in p for p in spec.problems())
+
+    def test_the_setup_preview_reads_as_commands(self) -> None:
+        spec = ContainerSpec(image="img", volumes=[Volume("build", "/work/build", "D:\\yocto")])
+        text = spec.setup_preview("podman")
+        assert text.startswith("podman volume create")
+        assert "device=/mnt/d/yocto" in text
+
+
+class TestSuggestVolume:
+    def test_named_after_the_container(self) -> None:
+        assert suggest_volume("yocto") == ("yocto-data", "/work/data")
+
+    def test_an_image_reference_is_cleaned_up(self) -> None:
+        name, target = suggest_volume("localhost/devenv:latest")
+        assert name == "devenv-latest-data"
+        assert target == "/work/data"
+
+    def test_it_avoids_a_name_already_taken(self) -> None:
+        assert suggest_volume("yocto", ["yocto-data"]) == ("yocto-data2", "/work/data2")
+
+    def test_the_suggestions_are_valid(self) -> None:
+        name, target = suggest_volume("localhost/devenv:latest")
+        assert Volume(name, target).problems() == []
 
 class TestHelpers:
     @pytest.mark.parametrize(

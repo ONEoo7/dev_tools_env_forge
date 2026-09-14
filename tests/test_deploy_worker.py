@@ -10,7 +10,12 @@ import pytest
 
 pytest.importorskip("PyQt6")
 
-from devenv_forge.core.deploy import ContainerSpec, ImageInfo, Mount  # noqa: E402
+from devenv_forge.core.deploy import (  # noqa: E402
+    ContainerSpec,
+    ImageInfo,
+    Mount,
+    Volume,
+)
 from devenv_forge.core.podman import PodmanState, PodmanStatus  # noqa: E402
 from devenv_forge.ui import deploy_page  # noqa: E402
 
@@ -25,12 +30,20 @@ def share(tmp_path):
 @pytest.fixture
 def worker(monkeypatch):
     calls: list[list[str]] = []
-    state = {"run_code": 0, "run_output": "", "container": ""}
+    state = {
+        "run_code": 0,
+        "run_output": "",
+        "container": "",
+        "volume_code": 0,
+        "volume_output": "",
+    }
 
     def fake_stream(self, argv):
         calls.append(list(argv))
         if argv[1] == "run":
             return state["run_code"], state["run_output"]
+        if argv[1] == "volume":
+            return state["volume_code"], state["volume_output"]
         return 0, ""
 
     monkeypatch.setattr(deploy_page.DeployWorker, "_stream", fake_stream)
@@ -182,3 +195,72 @@ class TestPage:
         widget, _ = page
         widget.image_picker.setCurrentIndex(widget.image_picker.findData("docker.io/library/archlinux:latest"))
         assert "sets no working directory" in widget.start_label.text()
+
+
+def test_volumes_are_created_before_the_container(worker) -> None:
+    """A pinned volume podman creates on first use would land in the wrong place."""
+    w, calls, state, results = worker
+    spec = ContainerSpec(
+        image="img", name="dev", volumes=[Volume("dev-build", "/work/build", "D:\\yocto")]
+    )
+    w.deploy(spec, False)
+
+    assert _subcommands(calls) == ["volume", "run"]
+    assert calls[0][1:4] == ["volume", "create", "--driver"]
+    assert "device=/mnt/d/yocto" in calls[0]
+    assert results[-1] == (True, "dev is running")
+
+
+def test_a_volume_in_podman_storage_is_created_plainly(worker) -> None:
+    w, calls, state, results = worker
+    w.deploy(ContainerSpec(image="img", volumes=[Volume("dev-build", "/work/build")]), False)
+    assert calls[0][1:] == ["volume", "create", "dev-build"]
+
+
+def test_an_existing_volume_is_reused(worker) -> None:
+    """podman refuses to create it twice, which is not a reason to stop."""
+    w, calls, state, results = worker
+    state.update(
+        volume_code=125,
+        volume_output="Error: volume with name dev-build already exists: volume already exists",
+    )
+    w.deploy(ContainerSpec(image="img", name="dev", volumes=[Volume("dev-build", "/work/build")]), False)
+
+    assert _subcommands(calls) == ["volume", "run"]
+    assert results[-1] == (True, "dev is running")
+
+
+def test_a_volume_that_cannot_be_created_stops_the_deploy(worker) -> None:
+    """Starting anyway would give a container with its build tree missing."""
+    w, calls, state, results = worker
+    state.update(volume_code=125, volume_output="Error: mkdir /mnt/d/yocto: permission denied")
+    w.deploy(ContainerSpec(image="img", name="dev", volumes=[Volume("dev-build", "/work/build", "D:\\yocto")]), False)
+
+    assert _subcommands(calls) == ["volume"]
+    ok, message = results[-1]
+    assert not ok
+    assert "could not create the volume dev-build" in message
+    assert "permission denied" in message
+
+
+def test_every_volume_is_created(worker) -> None:
+    w, calls, state, results = worker
+    w.deploy(
+        ContainerSpec(
+            image="img",
+            volumes=[Volume("a", "/work/a"), Volume("b", "/work/b")],
+        ),
+        False,
+    )
+    assert _subcommands(calls) == ["volume", "volume", "run"]
+
+
+def test_a_replace_removes_the_container_but_never_the_volume(worker) -> None:
+    """Volumes outlive containers; that is the point of keeping a build in one."""
+    w, calls, state, results = worker
+    w.deploy(
+        ContainerSpec(image="img", name="dev", volumes=[Volume("dev-build", "/work/build")]),
+        True,
+    )
+    assert _subcommands(calls) == ["rm", "volume", "run"]
+    assert not any(argv[1:3] == ["volume", "rm"] for argv in calls)
