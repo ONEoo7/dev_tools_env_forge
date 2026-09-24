@@ -445,7 +445,19 @@ class TestLcovJsonModule:
 
     def test_is_not_an_msys2_package(self) -> None:
         assert self._spec("json-xs").msys2 == ""
-        assert all(spec.msys2 for spec in CATALOG if spec.key != "json-xs")
+
+    def test_only_rows_added_on_purpose_lack_an_msys2_source(self) -> None:
+        """Provenance stays auditable: a row with no MSYS2 source is one added
+        deliberately and listed here, not one that forgot to say where it came
+        from. The Clang, analysis and coverage rows came from a later review of
+        what a C/C++ quality toolchain needs, not from the MSYS2 list."""
+        added_for_the_image = {
+            "json-xs",
+            "clang", "clang-format", "clang-tidy", "clangd", "llvm", "clang-rt",
+            "gcc-asan", "gcc-ubsan", "cppcheck", "valgrind", "pre-commit",
+            "ccache", "gcovr",
+        }
+        assert {spec.key for spec in CATALOG if not spec.msys2} == added_for_the_image
 
     @pytest.mark.parametrize("distro_key", sorted(INDEX_NAMES))
     def test_resolved_rows_reach_the_containerfile(self, distro_key: str) -> None:

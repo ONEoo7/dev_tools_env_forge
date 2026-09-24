@@ -144,3 +144,30 @@ class TestTheEmulationNote:
         assert page.arch_note.isVisibleTo(page)
         assert "emulation" in page.arch_note.text()
         assert "Exec format error" in page.arch_note.text()
+
+
+class TestPackageExtrasNameTheirPackages:
+    """A packages-only extra has no command, so its card names what it adds."""
+
+    def test_the_names_follow_the_chosen_base(self, page) -> None:
+        _pick(page, "debian", "amd64")
+        assert _row(page, "mingw-ucrt").command_label.text() == (
+            "gcc-mingw-w64-ucrt64 g++-mingw-w64-ucrt64"
+        )
+        _pick(page, "arch", "amd64")
+        assert _row(page, "mingw-ucrt").command_label.text() == "mingw-w64-gcc"
+
+    def test_wine_is_two_packages_on_apt_and_one_elsewhere(self, page) -> None:
+        _pick(page, "ubuntu", "amd64")
+        assert _row(page, "wine").command_label.text() == "wine wine64"
+        _pick(page, "fedora", "amd64")
+        assert _row(page, "wine").command_label.text() == "wine"
+
+    def test_a_build_host_still_sums_its_long_list_up(self, page) -> None:
+        _pick(page, "ubuntu", "amd64")
+        assert _row(page, "aosp").command_label.text() == "18 distribution packages"
+
+    def test_mingw_is_not_offered_where_only_msvcrt_exists(self, page) -> None:
+        _pick(page, "ubuntu", "amd64")
+        assert not _row(page, "mingw-ucrt").isVisibleTo(page)
+        assert _row(page, "wine").isVisibleTo(page)

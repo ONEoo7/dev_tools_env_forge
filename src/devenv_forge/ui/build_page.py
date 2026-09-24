@@ -49,6 +49,7 @@ KIND_LABEL = {
     ExtraKind.CARGO_INSTALL: "cargo install",
     ExtraKind.SDK: "git clone",
     ExtraKind.BUILD_HOST: "build host",
+    ExtraKind.PACKAGES: "packages",
 }
 
 
@@ -113,6 +114,9 @@ class ExtraRow(QFrame):
         super().__init__()
         self.extra = extra
         self.palette_ = palette
+        #: What the command line shows depends on both, so both are kept.
+        self._version = extra.fallback_tag
+        self._distro = ""
         self.setObjectName("Card")
 
         layout = QVBoxLayout(self)
@@ -159,22 +163,32 @@ class ExtraRow(QFrame):
     def _command_text(self, version: str) -> str:
         """The command as it will be written, with the tag filled in.
 
-        An extra whose requirements are a package list runs no command at all,
-        so it says what it does add rather than leaving the line blank.
+        An extra that is only packages runs no command at all, so it says what
+        it adds on the base now chosen, which differs by distribution: MinGW is
+        two packages on Debian and one on Arch. A few names are shown as they
+        are; a build host's long requirement list is summed up instead.
         """
         if not self.extra.command.strip():
-            # Such an extra is written for one distribution, so that is the
-            # list to count; a row is only ever shown on its own base anyway.
-            key = self.extra.distros[0] if self.extra.distros else ""
+            key = self._distro or (self.extra.distros[0] if self.extra.distros else "")
             packages = self.extra.build_packages.get(key, ())
-            return f"{len(packages)} distribution packages" if packages else ""
+            if not packages:
+                return ""
+            if self.extra.kind is ExtraKind.PACKAGES:
+                return " ".join(packages)
+            return f"{len(packages)} distribution packages"
         if "{version}" not in self.extra.command:
             return self.extra.command
         return self.extra.command.format(version=version or "<unresolved>")
 
     def set_version(self, version: str) -> None:
         """Show the resolved release tag rather than the placeholder."""
+        self._version = version
         self.command_label.setText(self._command_text(version))
+
+    def set_distro(self, distro_key: str) -> None:
+        """Show what this extra installs on the base now chosen."""
+        self._distro = distro_key
+        self.command_label.setText(self._command_text(self._version))
 
     def set_forced_by(self, labels: list[str]) -> None:
         """Lock the checkbox on when another selected extra depends on it."""
@@ -497,6 +511,7 @@ class BuildPage(QWidget):
                 )
         for row in self.rows:
             row.setVisible(row.extra.applies_to(key, arch.key))
+            row.set_distro(key)
 
     def _arch_note(self, spec) -> str:
         """What is worth saying about building for this target, if anything."""

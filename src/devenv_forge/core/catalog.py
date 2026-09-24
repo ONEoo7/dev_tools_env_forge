@@ -98,6 +98,9 @@ class Distro:
     tls_packages: tuple[str, ...] = ("curl", "ca-certificates")
     #: Set when versions come from a stand-in rather than the product itself.
     proxy_note: str = ""
+    #: Where the distribution serves debug info, for a distribution whose
+    #: tools cannot run without it. Empty everywhere it is not needed.
+    debuginfod: str = ""
     caveat: str = ""
 
     def supports(self, arch_key: str) -> bool:
@@ -163,6 +166,14 @@ DISTROS: tuple[Distro, ...] = (
         install_cmd="dnf install -y",
         cadence=Cadence.STABLE,
         support="10 years, to 2035",
+        # The comparison counts EPEL as part of RHEL, and so must the image:
+        # UBI ships without it, so every EPEL package the matrix promised --
+        # the Arm toolchain, uv, cppcheck, ccache, gcovr, pre-commit -- would
+        # otherwise fail the install. Checked on the UBI 10 image.
+        update_cmd=(
+            "dnf install -y "
+            "https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm"
+        ),
         clean_cmd="dnf clean all",
         proxy_note=(
             "Red Hat publishes no open package index, so these are read from "
@@ -204,6 +215,12 @@ DISTROS: tuple[Distro, ...] = (
         # Arch itself targets x86-64; the ARM ports are separate projects with
         # their own images, so the official one has no arm64 manifest at all.
         arches=("amd64",),
+        # Arch strips glibc's dynamic loader, and Valgrind cannot start without
+        # its symbols: "a function redirection which is mandatory ... cannot be
+        # set up". Arch's fix is debuginfod, exported by /etc/profile.d for
+        # login shells only, which a container command never is. The address
+        # is the one Arch ships in /etc/debuginfod/archlinux.urls.
+        debuginfod="https://debuginfod.archlinux.org",
         caveat=(
             "Rolling. Newest of everything today, different tomorrow, which "
             "works against a reproducible team image. x86-64 only: the "
@@ -246,6 +263,8 @@ GROUP_HOST = "Host toolchain"
 GROUP_BUILD = "Build system"
 GROUP_LANG = "Languages and runtimes"
 GROUP_DOCS = "Docs and coverage"
+GROUP_CLANG = "Clang and LLVM"
+GROUP_ANALYSIS = "Analysis and sanitizers"
 
 
 def _n(ubuntu, debian, fedora, rhel, alpine, arch) -> dict[str, tuple[str, ...]]:
@@ -266,6 +285,25 @@ def _n(ubuntu, debian, fedora, rhel, alpine, arch) -> dict[str, tuple[str, ...]]
 def _all(name: str) -> dict[str, tuple[str, ...]]:
     """Same package name everywhere."""
     return {key: (name,) for key in DISTRO_KEYS}
+
+
+#: The LLVM release the apt distributions are pinned to. Their unversioned
+#: packages are whatever LLVM the release happened to ship -- 21 on Ubuntu
+#: 26.04, 19 on Debian 13 -- so the versioned names keep them level with the
+#: distributions that package one current LLVM under plain names. The Build
+#: image page derives the matching PATH from the installed name, so this is the
+#: only place the number lives.
+LLVM_APT = "22"
+
+
+def _llvm(apt: str, redhat: str, alpine: str, arch: str) -> dict[str, tuple[str, ...]]:
+    """Names for one LLVM component: versioned on apt and Alpine, plain elsewhere.
+
+    ``{v}`` in *apt* and *alpine* becomes :data:`LLVM_APT`. Fedora and RHEL
+    share their naming, so *redhat* serves both.
+    """
+    apt_name = apt.format(v=LLVM_APT)
+    return _n(apt_name, apt_name, redhat, redhat, alpine.format(v=LLVM_APT), arch)
 
 
 CATALOG: tuple[PackageSpec, ...] = (
@@ -364,6 +402,107 @@ CATALOG: tuple[PackageSpec, ...] = (
         ),
         note="A meta-package pulling in the compiler and build tools. It has no version of its own.",
     ),
+    # -- Clang and LLVM ------------------------------------------------------
+    # Not from the MSYS2 list: added from a later analysis of what a C/C++
+    # quality toolchain needs, then checked name by name against each index.
+    PackageSpec(
+        key="clang",
+        label="Clang",
+        msys2="",
+        group=GROUP_CLANG,
+        names=_llvm("clang-{v}", "clang", "clang{v}", "clang"),
+        projects=("llvm", "clang"),
+        note=(
+            f"LLVM {LLVM_APT} on Ubuntu and Debian, whose unversioned clang is "
+            "21 and 19. RHEL packages an older LLVM than the rest."
+        ),
+    ),
+    PackageSpec(
+        key="clang-format",
+        label="clang-format",
+        msys2="",
+        group=GROUP_CLANG,
+        names=_llvm("clang-format-{v}", "clang-tools-extra", "clang{v}-extra-tools", "clang"),
+        projects=("llvm",),
+        note=(
+            "One package with clang-tidy and clangd outside the apt "
+            "distributions, and part of clang itself on Arch."
+        ),
+    ),
+    PackageSpec(
+        key="clang-tidy",
+        label="clang-tidy",
+        msys2="",
+        group=GROUP_CLANG,
+        names=_llvm("clang-tidy-{v}", "clang-tools-extra", "clang{v}-extra-tools", "clang"),
+        projects=("llvm",),
+    ),
+    PackageSpec(
+        key="clangd",
+        label="clangd",
+        msys2="",
+        group=GROUP_CLANG,
+        names=_llvm("clangd-{v}", "clang-tools-extra", "clang{v}-extra-tools", "clang"),
+        projects=("llvm",),
+    ),
+    PackageSpec(
+        key="llvm",
+        label="LLVM tools",
+        msys2="",
+        group=GROUP_CLANG,
+        names=_llvm("llvm-{v}", "llvm", "llvm{v}", "llvm"),
+        projects=("llvm",),
+        note=(
+            "llvm-cov for coverage from clang builds, and llvm-symbolizer, "
+            "without which a sanitizer report is a column of raw addresses."
+        ),
+    ),
+    PackageSpec(
+        key="clang-rt",
+        label="Clang sanitizer runtime",
+        msys2="",
+        group=GROUP_CLANG,
+        names=_llvm("libclang-rt-{v}-dev", "compiler-rt", "compiler-rt", "compiler-rt"),
+        projects=("llvm", "compiler-rt"),
+        note=(
+            "What clang -fsanitize links against. The apt clang only recommends "
+            "it, and an image installs without recommends."
+        ),
+    ),
+    # -- analysis and sanitizers ---------------------------------------------
+    PackageSpec(
+        key="gcc-asan",
+        label="AddressSanitizer runtime (GCC)",
+        msys2="",
+        group=GROUP_ANALYSIS,
+        names=_n("libasan8", "libasan8", "libasan", "libasan", "gcc", "gcc"),
+        projects=("gcc",),
+        note=(
+            "A package of its own on Fedora and RHEL. Everywhere else it comes "
+            "with gcc, which is why Alpine and Arch show gcc here; it runs on "
+            "Alpine's musl as well."
+        ),
+    ),
+    PackageSpec(
+        key="gcc-ubsan",
+        label="UBSan runtime (GCC)",
+        msys2="",
+        group=GROUP_ANALYSIS,
+        names=_n("libubsan1", "libubsan1", "libubsan", "libubsan", "gcc", "gcc"),
+        projects=("gcc",),
+    ),
+    PackageSpec(
+        key="cppcheck", label="Cppcheck", msys2="",
+        group=GROUP_ANALYSIS, names=_all("cppcheck"), projects=("cppcheck",),
+    ),
+    PackageSpec(
+        key="valgrind", label="Valgrind", msys2="",
+        group=GROUP_ANALYSIS, names=_all("valgrind"), projects=("valgrind",),
+    ),
+    PackageSpec(
+        key="pre-commit", label="pre-commit", msys2="",
+        group=GROUP_ANALYSIS, names=_all("pre-commit"), projects=("pre-commit",),
+    ),
     # -- build system --------------------------------------------------------
     PackageSpec(
         key="cmake", label="CMake", msys2="mingw-w64-ucrt-x86_64-cmake",
@@ -383,6 +522,10 @@ CATALOG: tuple[PackageSpec, ...] = (
     PackageSpec(
         key="git", label="Git", msys2="git",
         group=GROUP_BUILD, names=_all("git"), projects=("git",),
+    ),
+    PackageSpec(
+        key="ccache", label="ccache", msys2="",
+        group=GROUP_BUILD, names=_all("ccache"), projects=("ccache",),
     ),
     # -- languages -----------------------------------------------------------
     PackageSpec(
@@ -445,6 +588,11 @@ CATALOG: tuple[PackageSpec, ...] = (
             "JSON::PP, warns on every run, and captures several times slower. "
             "No distro makes it a hard dependency of lcov."
         ),
+    ),
+    PackageSpec(
+        key="gcovr", label="gcovr", msys2="",
+        group=GROUP_DOCS, names=_all("gcovr"), projects=("gcovr",),
+        note="7.2 on Ubuntu and Debian, a major version behind the rest.",
     ),
 )
 

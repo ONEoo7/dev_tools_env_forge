@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -99,7 +100,9 @@ def generate(spec: ImageSpec) -> str:
         "",
     ]
 
-    packages = list(spec.packages)
+    # Several catalogue rows can name one package: clang-format, clang-tidy and
+    # clangd are all clang-tools-extra on Fedora, and all of clang on Arch.
+    packages = list(dict.fromkeys(spec.packages))
     dropped: list[str] = []
     if spec.needs_rust:
         # rustup brings its own rustc and cargo. Installing the distro's Rust
@@ -133,6 +136,9 @@ def generate(spec: ImageSpec) -> str:
             "",
         ]
 
+    lines += _llvm_path_section(packages)
+    lines += _debuginfod_section(distro, packages)
+
     if spec.needs_rust:
         lines += _rust_section(spec)
 
@@ -155,6 +161,72 @@ def generate(spec: ImageSpec) -> str:
         "",
     ]
     return "\n".join(lines).rstrip() + "\n"
+
+
+#: A versioned LLVM package, and the directory holding all of its plain command
+#: names. The apt distributions call it clang-22 and keep it in llvm-22; Alpine
+#: calls it clang22 and keeps it in llvm22.
+_VERSIONED_LLVM = (
+    (re.compile(r"^(?:clang|llvm)-(\d+)$"), "/usr/lib/llvm-{v}/bin"),
+    (re.compile(r"^(?:clang|llvm)(\d+)$"), "/usr/lib/llvm{v}/bin"),
+)
+
+#: The compiler and the tools packages themselves, however each distribution
+#: versions them -- clang, clang-22, clang22 -- but not clang-format-22 or
+#: clang-tools-extra, which install no clang of their own.
+_CLANG_RE = re.compile(r"^clang(?:-?\d+)?$")
+_LLVM_RE = re.compile(r"^llvm(?:-?\d+)?$")
+
+
+def llvm_bin_dir(packages: Sequence[str]) -> str:
+    """Where a versioned LLVM keeps every plain command name, or ""."""
+    for name in packages:
+        for pattern, directory in _VERSIONED_LLVM:
+            match = pattern.match(name)
+            if match:
+                return directory.format(v=match.group(1))
+    return ""
+
+
+def _llvm_path_section(packages: Sequence[str]) -> list[str]:
+    """Put a versioned LLVM's plain command names on PATH.
+
+    A versioned LLVM puts only part of itself on PATH, and not the same part
+    everywhere. Ubuntu and Debian install clang-22 as /usr/bin/clang-22 with no
+    plain clang at all, and the same for every other tool. Alpine links clang
+    and the clang tools but not llvm-cov or llvm-symbolizer, of which it has
+    only llvm22-symbolizer. Either way a sanitizer report cannot find
+    llvm-symbolizer to turn its addresses into file and line. Both keep every
+    plain name in one directory, which goes first on PATH.
+    """
+    directory = llvm_bin_dir(packages)
+    if not directory:
+        return []
+    return [
+        "# This LLVM puts only part of itself on PATH, and never llvm-symbolizer,",
+        "# which a sanitizer needs to name a file and line. Its own bin directory",
+        "# has every plain name.",
+        f"ENV PATH={directory}:$PATH",
+        "",
+    ]
+
+
+def _debuginfod_section(distro: Distro, packages: Sequence[str]) -> list[str]:
+    """Let Valgrind start where the distribution strips the dynamic loader.
+
+    Tied to Valgrind rather than set for every image: it is the tool that fails
+    outright without it, while GDB, which would also use it, asks before
+    fetching anything and does well enough without.
+    """
+    if not distro.debuginfod or "valgrind" not in packages:
+        return []
+    return [
+        f"# {distro.label} strips the dynamic loader, and Valgrind will not start",
+        "# without its symbols. The distribution serves them over debuginfod,",
+        "# fetched on first use and cached; login shells get this, containers not.",
+        f"ENV DEBUGINFOD_URLS={distro.debuginfod}",
+        "",
+    ]
 
 
 def _rust_section(spec: ImageSpec) -> list[str]:
@@ -295,6 +367,12 @@ def _verify_command(spec: ImageSpec) -> str:
     checks: list[str] = []
     if any(p.startswith(("gcc-arm", "arm-none-eabi-gcc")) for p in spec.packages):
         checks.append("arm-none-eabi-gcc --version")
+    # By their plain names, which is exactly what the LLVM PATH line is for:
+    # on Ubuntu and Debian only the -22 names exist without it.
+    if any(_CLANG_RE.match(p) for p in spec.packages):
+        checks.append("clang --version")
+    if any(_LLVM_RE.match(p) for p in spec.packages):
+        checks.append("llvm-symbolizer --version")
     if spec.needs_rust:
         checks.append("rustc --version")
         checks.append("rustup target list --installed")

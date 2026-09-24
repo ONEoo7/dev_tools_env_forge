@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# DevEnv Forge writes the Containerfile into the build context it is pointed
+# at. It is output of whatever was last selected, so it is not tracked here;
+# version it in the repository of the project the image serves.
+/Containerfile

@@ -169,7 +169,8 @@ engine as present and every later stage would then fail.
 Compares one embedded toolchain across Ubuntu, Debian, Fedora, RHEL, Alpine and
 Arch. The package list is derived from a working MSYS2 setup and covers the Arm
 bare-metal toolchain, QEMU, OpenOCD, the build system, Python and coverage
-tooling. The newest version in each row is highlighted, and selecting a distro
+tooling, plus a C/C++ quality toolchain added later: Clang and LLVM, the
+sanitizers, and the analysers. The newest version in each row is highlighted, and selecting a distro
 generates the install line with that distro's package names.
 
 **Versions are read live, never stored.** A hardcoded table would be wrong
@@ -209,7 +210,7 @@ Arm compiler is `gcc-arm-none-eabi` on Debian, `arm-none-eabi-gcc-cs` on Fedora
 and `arm-none-eabi-gcc` on Arch. Debian and Ubuntu dropped the dedicated Arm GDB
 in favour of `gdb-multiarch`.
 
-**One row is not from the MSYS2 list: JSON::XS for LCOV.** lcov 2 reads gcov's
+**JSON::XS for LCOV is not from the MSYS2 list.** lcov 2 reads gcov's
 JSON output through a Perl JSON module and prefers JSON::XS. No distribution
 makes that module a hard dependency of lcov; Arch lists `perl-json-xs` only as
 optional. A plain `lcov` install therefore falls back to the pure-Perl JSON::PP
@@ -242,6 +243,117 @@ API answers HTTP 429 under concurrency, and treating that silently as "no such
 package" turned five real packages into apparent absences. Arch is now read from
 the repository databases instead, which have no such limit, and any lookup that
 does fail is reported as unknown with the reason.
+
+### The C/C++ quality toolchain
+
+Clang and LLVM, both sanitizer runtimes, Cppcheck, Valgrind, gcovr, ccache and
+pre-commit came from a later review, not from the MSYS2 list. Every name in that
+review was checked against each distribution's own index before it went into the
+catalogue, and a few of its claims did not survive the checking.
+
+| Tool | Ubuntu 26.04 | Debian 13 | Fedora 44 | RHEL 10 | Alpine 3.24 | Arch |
+| --- | --- | --- | --- | --- | --- | --- |
+| Clang | `clang-22` | `clang-22` | `clang` | `clang` | `clang22` | `clang` |
+| clang-format, clang-tidy, clangd | `-22` each | `-22` each | `clang-tools-extra` | `clang-tools-extra` | `clang22-extra-tools` | in `clang` |
+| LLVM tools | `llvm-22` | `llvm-22` | `llvm` | `llvm` | `llvm22` | `llvm` |
+| Clang sanitizer runtime | `libclang-rt-22-dev` | `libclang-rt-22-dev` | `compiler-rt` | `compiler-rt` | `compiler-rt` | `compiler-rt` |
+| GCC sanitizer runtimes | with gcc | with gcc | `libasan` `libubsan` | `libasan` `libubsan` | with gcc | with gcc |
+
+Cppcheck, Valgrind, gcovr, ccache and pre-commit have the same name on all six.
+
+**LLVM is pinned to 22 on the apt distributions**, because their unversioned
+`clang` is whatever the release shipped: 21.1 on Ubuntu 26.04 and 19 on Debian
+13. The pin is one constant, `LLVM_APT` in
+[catalog.py](src/devenv_forge/core/catalog.py). RHEL is behind the others at
+20.1 and has nothing newer to pin to.
+
+**A versioned LLVM puts only part of itself on `PATH`, and a different part on
+each distribution.** On Ubuntu and Debian `clang-22` installs `/usr/bin/clang-22`
+and no `clang`, and the same goes for clang-format, clang-tidy, clangd, llvm-cov
+and llvm-symbolizer; checked in the Ubuntu image, none of the six was on `PATH`.
+Alpine's `llvm22` links clang and the clang tools but not llvm-cov or
+llvm-symbolizer, of which it has only `llvm22-symbolizer`. That breaks `CC=clang`
+loudly on apt and the sanitizers quietly everywhere: a report that cannot find
+`llvm-symbolizer` is a column of raw addresses. Both keep every plain name in one
+directory -- `/usr/lib/llvm-22/bin` on apt, `/usr/lib/llvm22/bin` on Alpine -- so
+the image puts it first on `PATH`, and the smoke test calls `clang` and
+`llvm-symbolizer` by their plain names. That check is what caught Alpine: its
+first build failed on `llvm-symbolizer: not found`.
+
+**Several rows can be one package.** clang-format, clang-tidy and clangd are one
+package on Fedora, RHEL and Alpine and part of `clang` on Arch, so the install
+line is de-duplicated rather than naming `clang-tools-extra` three times.
+
+**GCC's sanitizer runtimes come with gcc, except on Fedora and RHEL**, where
+they are `libasan` and `libubsan`. Elsewhere the row names the package that
+carries them. That holds on Alpine too: ASan built with gcc caught a heap
+overflow under musl, which was worth checking rather than assuming.
+
+**RHEL images now enable EPEL, and needed it before this.** The comparison reads
+RHEL as CentOS Stream plus EPEL, but the UBI base image ships without EPEL, so
+every EPEL package the matrix promised failed the install. Four of the new tools
+are EPEL on RHEL -- Cppcheck, ccache, gcovr and pre-commit -- and so were the
+Arm toolchain and uv already. Installing `epel-release` first fixes all of them;
+tested on UBI 10.
+
+**Valgrind does not start on Arch without debuginfod.** Arch strips glibc's
+dynamic loader, and Valgrind needs its symbols before it can run anything:
+
+```
+valgrind:  Fatal error at startup: a function redirection
+valgrind:  which is mandatory for this platform-tool combination
+valgrind:  cannot be set up.
+```
+
+Arch's own fix is to fetch them from its debuginfod server, and
+`/etc/profile.d/debuginfod.sh` sets that up -- for login shells, which a
+container command never is. So an Arch image with Valgrind sets
+`DEBUGINFOD_URLS` itself, to the address Arch ships in
+`/etc/debuginfod/archlinux.urls`. The first run fetches the loader's symbols in
+about three seconds and later runs use the cache. This one surfaced only because
+the check ran Valgrind on a real bug: `valgrind --version` works fine on the
+broken install, and the failed run even exits 0.
+
+**Three existing rows still cannot install on RHEL**, which predates this work:
+doxygen and perl-JSON-XS are in CentOS Stream's CodeReady Builder but not in the
+smaller subset UBI publishes, and lcov is in EPEL but needs something UBI does
+not carry. The comparison shows them as available because Stream has them. A
+RHEL image with the whole catalogue therefore still fails to build.
+
+**Every distribution was built and made to use the tools**, not just asked for
+their versions. One image each, with every new row and whichever of MinGW and
+Wine it offers, then a program with a heap overflow compiled under
+AddressSanitizer by both clang and gcc, a planted uninitialised read put to
+Cppcheck and Valgrind, the clang tools run, and where MinGW is present a Windows
+program built and run under Wine:
+
+| | Ubuntu | Debian | Fedora | RHEL | Alpine | Arch |
+| --- | --- | --- | --- | --- | --- | --- |
+| Image | 2.56 GB | 2.56 GB | 4.91 GB | 1.31 GB | 2.04 GB | 5.02 GB |
+| ASan, clang and gcc | file and line | file and line | file and line | file and line | file and line | file and line |
+| Cppcheck, Valgrind | both flag it | both flag it | both flag it | both flag it | both flag it | both flag it |
+| MinGW `.exe` | -- | UCRT | UCRT | -- | UCRT | UCRT |
+| Wine runs it | -- | yes | yes | -- | yes | yes |
+
+"File and line" is the point of that row: a sanitizer that finds the bug but
+cannot name where is what the `PATH` fix above prevents. Two of the six only
+passed after a fix this work added -- Alpine's `PATH` and Arch's Valgrind -- and
+the table is from after both.
+
+**MinGW-w64 and Wine are extras, not rows**, because every catalogue row goes
+into every image and both are large and serve one workflow. They are off by
+default and offered only where they exist:
+
+| Extra | Offered on | Not on |
+| --- | --- | --- |
+| MinGW-w64 cross-compiler (UCRT) | Debian, Fedora, Alpine, Arch | Ubuntu and RHEL, which package only the older msvcrt build |
+| Wine | Ubuntu, Debian, Fedora, Alpine, Arch | RHEL, which does not package it |
+
+Alpine's and Arch's `mingw-w64-gcc` say nothing about their C runtime in the
+name, so each was checked by compiling a program and reading its imports: both
+link `api-ms-win-crt`, which is UCRT, not `msvcrt.dll`. Both extras are x86-64
+only for now: Wine does not translate an x86-64 program on ARM64, and the ARM64
+MinGW packages have not been checked.
 
 ### Speed
 
@@ -286,10 +398,14 @@ rustup and cargo, so they cannot appear in the base image comparison:
 | GoogleTest, with gMock | built from source at its release tag |
 | Yocto Project build host | Ubuntu only, see below |
 | Android (AOSP) build host | Ubuntu only, see below |
+| MinGW-w64 cross-compiler (UCRT) | distribution packages, where a UCRT build exists |
+| Wine | distribution packages, everywhere but RHEL |
 
-Every extra starts selected, except one written for a single base image.
+Every extra starts selected, except the build hosts, which are written for a
+single base image, and MinGW and Wine, which are large and serve one workflow.
 Untick the ones a team does not need; the source builds, probe-rs above all,
-are what make a full build slow.
+are what make a full build slow. Which distributions carry MinGW and Wine, and
+why, is under [the quality toolchain](#the-cc-quality-toolchain).
 
 probe-rs compiles from source, so it automatically adds the udev and libusb
 development headers it links against, under the right name for the chosen

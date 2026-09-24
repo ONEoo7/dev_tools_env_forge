@@ -13,6 +13,10 @@ The third is a build host set up to an upstream project's own documented
 requirements. Those requirements name a distribution's packages, so such an
 extra is offered on the distributions it was written for and nowhere else --
 :attr:`Extra.distros`.
+
+The fourth is plain distribution packages that the comparison catalogue
+deliberately leaves out, because only some images want them. Every catalogue
+row goes into every image; these wait to be asked for.
 """
 
 from __future__ import annotations
@@ -32,6 +36,9 @@ class ExtraKind(str, Enum):
     #: requirements: their package list and the settings they insist on.
     #: Nothing is fetched, so there is no version to pin.
     BUILD_HOST = "build host"
+    #: Distribution packages kept out of the image unless asked for, because
+    #: they are large or serve one workflow. No command, no configuration.
+    PACKAGES = "packages"
 
 
 #: The kinds that need rustup present. An SDK checkout does not, so adding one
@@ -203,6 +210,29 @@ _AOSP_PACKAGES = {
         "fontconfig",
         "repo",
     ),
+}
+
+
+#: MinGW-w64 built against the Universal C Runtime, per distribution. Ubuntu
+#: 26.04 and RHEL 10 package only the older msvcrt build, so they have none.
+#: Alpine's and Arch's names say nothing about the runtime; compiling a program
+#: with each and reading its imports showed api-ms-win-crt, which is UCRT.
+_MINGW_UCRT_PACKAGES = {
+    "debian": ("gcc-mingw-w64-ucrt64", "g++-mingw-w64-ucrt64"),
+    "fedora": ("ucrt64-gcc", "ucrt64-gcc-c++"),
+    "alpine": ("mingw-w64-gcc",),
+    "arch": ("mingw-w64-gcc",),
+}
+
+
+#: Wine, to run what the cross-compiler produces. The apt distributions split
+#: the 64-bit loader into its own package; RHEL does not package Wine at all.
+_WINE_PACKAGES = {
+    "ubuntu": ("wine", "wine64"),
+    "debian": ("wine", "wine64"),
+    "fedora": ("wine",),
+    "alpine": ("wine",),
+    "arch": ("wine",),
 }
 
 
@@ -428,6 +458,49 @@ EXTRAS: tuple[Extra, ...] = (
             "Windows-backed path is hundreds of times slower."
         ),
         build_packages=_AOSP_PACKAGES,
+    ),
+    Extra(
+        key="mingw-ucrt",
+        label="MinGW-w64 cross-compiler (UCRT)",
+        kind=ExtraKind.PACKAGES,
+        command="",
+        default_on=False,
+        distros=("debian", "fedora", "alpine", "arch"),
+        # Checked on x86-64 only; the ARM64 packages have not been looked at.
+        arches=("amd64",),
+        # Debian and Fedora name the UCRT compiler x86_64-w64-mingw32ucrt-gcc,
+        # Alpine and Arch plain x86_64-w64-mingw32-gcc. Grouped, because an
+        # ungrouped || inside the smoke test's && chain would let an earlier
+        # failure fall through to it and pass.
+        verify="(x86_64-w64-mingw32ucrt-gcc --version || x86_64-w64-mingw32-gcc --version)",
+        note=(
+            "Builds Windows executables against the Universal C Runtime, the "
+            "same runtime as MSYS2's UCRT64. Not offered on Ubuntu 26.04 or "
+            "RHEL, whose only MinGW is the older msvcrt build. Alpine's and "
+            "Arch's packages carry no runtime in their names, so both were "
+            "checked by compiling with them: each links api-ms-win-crt, which "
+            "is UCRT."
+        ),
+        build_packages=_MINGW_UCRT_PACKAGES,
+    ),
+    Extra(
+        key="wine",
+        label="Wine",
+        kind=ExtraKind.PACKAGES,
+        command="",
+        default_on=False,
+        distros=("ubuntu", "debian", "fedora", "alpine", "arch"),
+        # Wine runs a program on the processor it was built for; it does not
+        # translate x86-64 on an ARM64 machine.
+        arches=("amd64",),
+        verify="wine --version",
+        note=(
+            "Runs the Windows executables a cross-compiler produces, so a test "
+            "suite can execute them on Linux. RHEL does not package it, and it "
+            "is x86-64 only here: Wine does not translate an x86-64 program on "
+            "ARM64."
+        ),
+        build_packages=_WINE_PACKAGES,
     ),
 )
 
